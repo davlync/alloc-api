@@ -4,6 +4,7 @@ import io
 import math
 import os
 import re
+from datetime import datetime, timezone
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Form
@@ -446,7 +447,7 @@ async def run_allocation(data: dict = {}):
         "status": "complete",
         "stats": stats,
         "warnings": warnings,
-        "completed_at": "now()",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", run_id).execute()
 
     return {"run_id": run_id, "status": "complete", "stats": stats, "warnings": warnings}
