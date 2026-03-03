@@ -5,7 +5,7 @@ import math
 import os
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from supabase import create_client, Client
@@ -64,13 +64,105 @@ def health_check():
     return {"status": "ok"}
 
 
+# ── Semesters ─────────────────────────────────────────────────────────────────
+
+@app.get("/semesters")
+def list_semesters():
+    sb = get_supabase()
+    res = (
+        sb.table("semesters")
+        .select("*")
+        .eq("college_id", COLLEGE_ID)
+        .order("start_date", desc=True)
+        .execute()
+    )
+    return res.data
+
+
+@app.post("/semesters")
+def create_semester(data: dict):
+    sb = get_supabase()
+    copy_from_semester_id = data.pop("copy_from_semester_id", None)
+    data["college_id"] = COLLEGE_ID
+    res = sb.table("semesters").insert(data).execute()
+    new_semester = res.data[0]
+    new_semester_id = new_semester["id"]
+
+    if copy_from_semester_id:
+        # 1. Copy blocks; build old_id → new_id map
+        src_blocks = (
+            sb.table("blocks")
+            .select("*")
+            .eq("college_id", COLLEGE_ID)
+            .eq("semester_id", copy_from_semester_id)
+            .execute()
+        )
+        block_id_map: dict[str, str] = {}
+        for block in src_blocks.data:
+            old_id = block["id"]
+            new_block = {k: v for k, v in block.items() if k not in ("id", "created_at")}
+            new_block["semester_id"] = new_semester_id
+            res_b = sb.table("blocks").insert(new_block).execute()
+            block_id_map[old_id] = res_b.data[0]["id"]
+
+        # 2. Copy rooms for each block
+        for old_block_id, new_block_id in block_id_map.items():
+            src_rooms = (
+                sb.table("rooms")
+                .select("*")
+                .eq("block_id", old_block_id)
+                .execute()
+            )
+            for room in src_rooms.data:
+                new_room = {k: v for k, v in room.items() if k not in ("id", "created_at", "blocks")}
+                new_room["block_id"] = new_block_id
+                new_room["semester_id"] = new_semester_id
+                sb.table("rooms").insert(new_room).execute()
+
+        # 3. Copy rules
+        src_rules = (
+            sb.table("rules")
+            .select("*")
+            .eq("college_id", COLLEGE_ID)
+            .eq("semester_id", copy_from_semester_id)
+            .execute()
+        )
+        for rule in src_rules.data:
+            new_rule = {k: v for k, v in rule.items() if k not in ("id", "created_at")}
+            new_rule["semester_id"] = new_semester_id
+            sb.table("rules").insert(new_rule).execute()
+
+    return new_semester
+
+
+@app.delete("/semesters/{semester_id}")
+def delete_semester(semester_id: str):
+    sb = get_supabase()
+    completed = (
+        sb.table("allocation_runs")
+        .select("id")
+        .eq("semester_id", semester_id)
+        .eq("status", "complete")
+        .execute()
+    )
+    if completed.data:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete semester with completed allocation runs",
+        )
+    sb.table("semesters").delete().eq("id", semester_id).eq("college_id", COLLEGE_ID).execute()
+    return {"deleted": semester_id}
+
+
 # ── Students ──────────────────────────────────────────────────────────────────
 
 @app.get("/students")
-def list_students():
+def list_students(semester_id: str | None = Query(None)):
     sb = get_supabase()
-    res = sb.table("students").select("*").eq("college_id", COLLEGE_ID).order("name").execute()
-    return res.data
+    q = sb.table("students").select("*").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q = q.eq("semester_id", semester_id)
+    return q.order("name").execute().data
 
 
 @app.post("/students")
@@ -106,7 +198,10 @@ def delete_student(student_id: str):
 
 
 @app.post("/students/import")
-async def import_students(file: UploadFile = File(...)):
+async def import_students(
+    file: UploadFile = File(...),
+    semester_id: str | None = Query(None),
+):
     """
     Accepts a CSV with columns: name, email, year, is_ra, accessibility_required
     is_ra and accessibility_required accept: true/false, yes/no, 1/0 (case-insensitive)
@@ -122,14 +217,17 @@ async def import_students(file: UploadFile = File(...)):
     errors = []
     for i, row in enumerate(reader, start=2):  # row 1 = header
         try:
-            rows.append({
+            entry = {
                 "college_id": COLLEGE_ID,
                 "name": row["name"].strip(),
                 "email": row["email"].strip().lower(),
                 "year": int(row["year"].strip()),
                 "is_ra": to_bool(row.get("is_ra", "false")),
                 "accessibility_required": to_bool(row.get("accessibility_required", "false")),
-            })
+            }
+            if semester_id:
+                entry["semester_id"] = semester_id
+            rows.append(entry)
         except (KeyError, ValueError) as e:
             errors.append({"row": i, "error": str(e)})
 
@@ -137,18 +235,21 @@ async def import_students(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail={"parse_errors": errors})
 
     sb = get_supabase()
-    # upsert on email so re-uploads don't duplicate
-    res = sb.table("students").upsert(rows, on_conflict="college_id,email").execute()
+    res = sb.table("students").upsert(
+        rows, on_conflict="college_id,semester_id,email"
+    ).execute()
     return {"imported": len(res.data), "rows": res.data}
 
 
 # ── Blocks ────────────────────────────────────────────────────────────────────
 
 @app.get("/blocks")
-def list_blocks():
+def list_blocks(semester_id: str | None = Query(None)):
     sb = get_supabase()
-    res = sb.table("blocks").select("*").eq("college_id", COLLEGE_ID).order("name").execute()
-    return res.data
+    q = sb.table("blocks").select("*").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q = q.eq("semester_id", semester_id)
+    return q.order("name").execute().data
 
 
 @app.post("/blocks")
@@ -186,16 +287,12 @@ def delete_block(block_id: str):
 # ── Rooms ─────────────────────────────────────────────────────────────────────
 
 @app.get("/rooms")
-def list_rooms():
+def list_rooms(semester_id: str | None = Query(None)):
     sb = get_supabase()
-    res = (
-        sb.table("rooms")
-        .select("*, blocks(name)")
-        .eq("college_id", COLLEGE_ID)
-        .order("room_number")
-        .execute()
-    )
-    return res.data
+    q = sb.table("rooms").select("*, blocks(name)").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q = q.eq("semester_id", semester_id)
+    return q.order("room_number").execute().data
 
 
 @app.post("/rooms")
@@ -234,10 +331,12 @@ def delete_room(room_id: str):
 # ── Rules ─────────────────────────────────────────────────────────────────────
 
 @app.get("/rules")
-def list_rules():
+def list_rules(semester_id: str | None = Query(None)):
     sb = get_supabase()
-    res = sb.table("rules").select("*").eq("college_id", COLLEGE_ID).order("rule_type").execute()
-    return res.data
+    q = sb.table("rules").select("*").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q = q.eq("semester_id", semester_id)
+    return q.order("rule_type").execute().data
 
 
 @app.post("/rules")
@@ -275,16 +374,12 @@ def delete_rule(rule_id: str):
 # ── Allocation runs ───────────────────────────────────────────────────────────
 
 @app.get("/runs")
-def list_runs():
+def list_runs(semester_id: str | None = Query(None)):
     sb = get_supabase()
-    res = (
-        sb.table("allocation_runs")
-        .select("*")
-        .eq("college_id", COLLEGE_ID)
-        .order("created_at", desc=True)
-        .execute()
-    )
-    return res.data
+    q = sb.table("allocation_runs").select("*").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q = q.eq("semester_id", semester_id)
+    return q.order("created_at", desc=True).execute().data
 
 
 @app.get("/runs/{run_id}")
@@ -312,13 +407,13 @@ def get_run(run_id: str):
 async def run_allocation(data: dict = {}):
     sb = get_supabase()
     cohort = data.get("cohort", "first-years")
+    semester_id = data.get("semester_id")
 
-    # Create the run record
-    run = (
-        sb.table("allocation_runs")
-        .insert({"college_id": COLLEGE_ID, "cohort": cohort, "status": "running"})
-        .execute()
-    )
+    run_payload: dict = {"college_id": COLLEGE_ID, "cohort": cohort, "status": "running"}
+    if semester_id:
+        run_payload["semester_id"] = semester_id
+
+    run = sb.table("allocation_runs").insert(run_payload).execute()
     run_id = run.data[0]["id"]
 
     # Simulate algorithm (replace with real algorithm later)
@@ -350,7 +445,10 @@ async def run_allocation(data: dict = {}):
 # ── Data upload / template ────────────────────────────────────────────────────
 
 @app.post("/data/upload")
-async def upload_data(file: UploadFile = File(...)):
+async def upload_data(
+    file: UploadFile = File(...),
+    semester_id: str | None = Form(None),
+):
     """
     Accept an xlsx with 3 sheets: students, blocks, wing_leaders.
     Upserts blocks and students, then pins RA-block assignments.
@@ -389,7 +487,7 @@ async def upload_data(file: UploadFile = File(...)):
         name = _safe_str(row.get("name"))
         if not name:
             continue
-        block_rows.append({
+        entry = {
             "college_id":    COLLEGE_ID,
             "name":          name,
             "block_cap_low": float(row.get("block_cap_low", 0.3) or 0.3),
@@ -397,11 +495,16 @@ async def upload_data(file: UploadFile = File(...)):
             "male_cap_low":  float(row.get("male_cap_low",  0.4) or 0.4),
             "male_cap_up":   float(row.get("male_cap_up",   0.6) or 0.6),
             "small_room_cap": _safe_int(row.get("small_room_cap", 0), 0),
-        })
+        }
+        if semester_id:
+            entry["semester_id"] = semester_id
+        block_rows.append(entry)
 
     block_name_to_id: dict[str, str] = {}
     if block_rows:
-        res_b = sb.table("blocks").upsert(block_rows, on_conflict="college_id,name").execute()
+        res_b = sb.table("blocks").upsert(
+            block_rows, on_conflict="college_id,semester_id,name"
+        ).execute()
         block_name_to_id = {b["name"]: b["id"] for b in res_b.data}
 
     # ── 2. Students ───────────────────────────────────────────────────────────
@@ -415,14 +518,13 @@ async def upload_data(file: UploadFile = File(...)):
             continue
         email = _safe_str(row.get("email"))
         if not email:
-            # Generate deterministic placeholder so upsert deduplication still works
             email = (
                 name.lower()
                 .replace(" ", ".")
                 .replace("'", "")
                 + "@christreasurer.upload"
             )
-        student_rows.append({
+        entry = {
             "college_id":            COLLEGE_ID,
             "name":                  name,
             "email":                 email.lower(),
@@ -441,12 +543,15 @@ async def upload_data(file: UploadFile = File(...)):
             "enemy_request_4":       _safe_str(row.get("enemy_request_4")),
             "block_request_1":       _safe_str(row.get("block_request_1")),
             "block_request_2":       _safe_str(row.get("block_request_2")),
-        })
+        }
+        if semester_id:
+            entry["semester_id"] = semester_id
+        student_rows.append(entry)
 
     student_name_to_id: dict[str, str] = {}
     if student_rows:
         res_s = sb.table("students").upsert(
-            student_rows, on_conflict="college_id,email"
+            student_rows, on_conflict="college_id,semester_id,email"
         ).execute()
         student_name_to_id = {s["name"]: s["id"] for s in res_s.data}
 

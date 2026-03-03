@@ -10,24 +10,37 @@ create table colleges (
   created_at timestamptz default now()
 );
 
--- 2. Blocks (buildings / staircases within a college)
+-- 2. Semesters (one per allocation period, child of college)
+create table semesters (
+  id            uuid primary key default gen_random_uuid(),
+  college_id    uuid references colleges(id) on delete cascade not null,
+  name          text not null,
+  academic_year text not null,
+  start_date    date not null,
+  created_at    timestamptz default now()
+);
+
+-- 3. Blocks (buildings / staircases within a college, scoped to a semester)
 create table blocks (
   id uuid primary key default gen_random_uuid(),
-  college_id uuid references colleges(id) on delete cascade not null,
+  college_id  uuid references colleges(id) on delete cascade not null,
+  semester_id uuid references semesters(id) on delete cascade,
   name text not null,
   block_cap_low   float not null default 0.3,
   block_cap_up    float not null default 0.9,
   male_cap_low    float not null default 0.4,
   male_cap_up     float not null default 0.6,
   small_room_cap  integer not null default 0,
-  created_at timestamptz default now()
+  created_at timestamptz default now(),
+  constraint blocks_college_semester_name_key unique nulls not distinct (college_id, semester_id, name)
 );
 
--- 3. Rooms
+-- 4. Rooms
 create table rooms (
   id uuid primary key default gen_random_uuid(),
-  college_id uuid references colleges(id) on delete cascade not null,
-  block_id uuid references blocks(id) on delete cascade not null,
+  college_id  uuid references colleges(id) on delete cascade not null,
+  semester_id uuid references semesters(id) on delete cascade,
+  block_id    uuid references blocks(id) on delete cascade not null,
   room_number text not null,
   floor int not null default 0,
   room_type text not null check (room_type in ('en-suite', 'shared-bathroom', 'studio')),
@@ -36,10 +49,11 @@ create table rooms (
   created_at timestamptz default now()
 );
 
--- 4. Students
+-- 5. Students
 create table students (
   id uuid primary key default gen_random_uuid(),
-  college_id uuid references colleges(id) on delete cascade not null,
+  college_id  uuid references colleges(id) on delete cascade not null,
+  semester_id uuid references semesters(id) on delete cascade,
   name text not null,
   email text not null,
   year int not null check (year between 1 and 5),
@@ -61,10 +75,10 @@ create table students (
   ra_block_id        uuid references blocks(id),
   preference_token uuid not null default gen_random_uuid(),
   created_at timestamptz default now(),
-  unique(college_id, email)
+  constraint students_college_semester_email_key unique nulls not distinct (college_id, semester_id, email)
 );
 
--- 5. Student preferences (table exists; form is disabled pending unique-link feature)
+-- 6. Student preferences (table exists; form is disabled pending unique-link feature)
 create table student_preferences (
   id uuid primary key default gen_random_uuid(),
   student_id uuid references students(id) on delete cascade not null unique,
@@ -75,10 +89,11 @@ create table student_preferences (
   submitted_at timestamptz default now()
 );
 
--- 6. Rules / constraints
+-- 7. Rules / constraints
 create table rules (
   id uuid primary key default gen_random_uuid(),
-  college_id uuid references colleges(id) on delete cascade not null,
+  college_id  uuid references colleges(id) on delete cascade not null,
+  semester_id uuid references semesters(id) on delete cascade,
   name text not null,
   rule_type text not null check (rule_type in ('hard', 'soft')),
   category text not null,
@@ -87,10 +102,11 @@ create table rules (
   created_at timestamptz default now()
 );
 
--- 7. Allocation runs
+-- 8. Allocation runs
 create table allocation_runs (
   id uuid primary key default gen_random_uuid(),
-  college_id uuid references colleges(id) on delete cascade not null,
+  college_id  uuid references colleges(id) on delete cascade not null,
+  semester_id uuid references semesters(id) on delete cascade,
   cohort text not null check (cohort in ('first-years', 'all')),
   status text not null default 'pending' check (status in ('pending', 'running', 'complete', 'failed')),
   stats jsonb,
@@ -99,7 +115,7 @@ create table allocation_runs (
   completed_at timestamptz
 );
 
--- 8. Allocations (results — one row per student per run)
+-- 9. Allocations (results — one row per student per run)
 create table allocations (
   id uuid primary key default gen_random_uuid(),
   run_id uuid references allocation_runs(id) on delete cascade not null,
