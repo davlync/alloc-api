@@ -3,6 +3,7 @@ import csv
 import io
 import math
 import os
+import re
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Form
@@ -46,6 +47,11 @@ def _safe_bool(val) -> bool | None:
     if s in ("nan", "none", "null", ""):
         return None
     return bool(int(float(s)))
+
+
+def _natural_key(s: str) -> list:
+    """Sort key that orders 'Block 2' before 'Block 10'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
 def _safe_int(val, default: int) -> int:
@@ -249,7 +255,9 @@ def list_blocks(semester_id: str | None = Query(None)):
     q = sb.table("blocks").select("*").eq("college_id", COLLEGE_ID)
     if semester_id:
         q = q.eq("semester_id", semester_id)
-    return q.order("name").execute().data
+    data = q.execute().data
+    data.sort(key=lambda b: _natural_key(b["name"]))
+    return data
 
 
 @app.post("/blocks")
@@ -292,7 +300,9 @@ def list_rooms(semester_id: str | None = Query(None)):
     q = sb.table("rooms").select("*, blocks(name)").eq("college_id", COLLEGE_ID)
     if semester_id:
         q = q.eq("semester_id", semester_id)
-    return q.order("room_number").execute().data
+    data = q.execute().data
+    data.sort(key=lambda r: _natural_key(r["room_number"]))
+    return data
 
 
 @app.post("/rooms")
@@ -450,8 +460,8 @@ async def upload_data(
     semester_id: str | None = Form(None),
 ):
     """
-    Accept an xlsx with 3 sheets: students, blocks, wing_leaders.
-    Upserts blocks and students, then pins RA-block assignments.
+    Accept an xlsx with required sheets: students, blocks, wing_leaders
+    and an optional rooms sheet.
 
     Students sheet columns (all except name/email optional):
       name, email, year, male, accessibility_required, small_room,
@@ -459,6 +469,9 @@ async def upload_data(
 
     Blocks sheet columns:
       name, block_cap_low, block_cap_up, male_cap_low, male_cap_up, small_room_cap
+
+    Rooms sheet columns (optional — replaces rooms for processed blocks):
+      block (name), room_number, floor, room_type, is_accessible, is_available
 
     Wing leaders sheet columns:
       name  (must match a student name),  block  (must match a block name)
@@ -507,7 +520,48 @@ async def upload_data(
         ).execute()
         block_name_to_id = {b["name"]: b["id"] for b in res_b.data}
 
-    # ── 2. Students ───────────────────────────────────────────────────────────
+    # ── 2. Rooms (optional sheet) ─────────────────────────────────────────────
+    rooms_upserted = 0
+    if "rooms" in xl.sheet_names and block_name_to_id:
+        df_r = xl.parse("rooms")
+        df_r.columns = [c.strip().lower().replace(" ", "_") for c in df_r.columns]
+
+        valid_room_types = {"en-suite", "shared-bathroom", "studio"}
+
+        # Group rows by block so we can delete-then-insert per block
+        rooms_by_block: dict[str, list] = {}
+        for _, row in df_r.iterrows():
+            block_name = _safe_str(row.get("block"))
+            room_number = _safe_str(row.get("room_number"))
+            if not block_name or not room_number:
+                continue
+            block_id = block_name_to_id.get(block_name)
+            if not block_id:
+                continue
+            room_type = _safe_str(row.get("room_type")) or "en-suite"
+            if room_type not in valid_room_types:
+                room_type = "en-suite"
+            entry = {
+                "college_id":   COLLEGE_ID,
+                "block_id":     block_id,
+                "room_number":  room_number,
+                "floor":        _safe_int(row.get("floor"), 0),
+                "room_type":    room_type,
+                "is_accessible": bool(_safe_bool(row.get("is_accessible")) or False),
+                "is_available":  bool(_safe_bool(row.get("is_available")) if row.get("is_available") is not None else True),
+            }
+            if semester_id:
+                entry["semester_id"] = semester_id
+            rooms_by_block.setdefault(block_id, []).append(entry)
+
+        for block_id, room_rows in rooms_by_block.items():
+            # Delete existing rooms for this block before re-inserting
+            sb.table("rooms").delete().eq("block_id", block_id).execute()
+            if room_rows:
+                sb.table("rooms").insert(room_rows).execute()
+                rooms_upserted += len(room_rows)
+
+    # ── 3. Students ───────────────────────────────────────────────────────────
     df_s = xl.parse("students")
     df_s.columns = [c.strip().lower().replace(" ", "_") for c in df_s.columns]
 
@@ -555,7 +609,7 @@ async def upload_data(
         ).execute()
         student_name_to_id = {s["name"]: s["id"] for s in res_s.data}
 
-    # ── 3. Wing leaders (RA pins) ─────────────────────────────────────────────
+    # ── 4. Wing leaders (RA pins) ─────────────────────────────────────────────
     df_l = xl.parse("wing_leaders")
     df_l.columns = [c.strip().lower().replace(" ", "_") for c in df_l.columns]
 
@@ -576,6 +630,7 @@ async def upload_data(
 
     return {
         "blocks_upserted":   len(block_rows),
+        "rooms_upserted":    rooms_upserted,
         "students_upserted": len(student_rows),
         "ras_pinned":        ra_count,
     }
@@ -613,6 +668,15 @@ def download_template():
             "male_cap_up":   [0.6,       0.6],
             "small_room_cap":[0,         0],
         }).to_excel(writer, sheet_name="blocks", index=False)
+
+        pd.DataFrame({
+            "block":         ["Block A", "Block A", "Block A", "Block B"],
+            "room_number":   ["A1",      "A2",      "A3",      "B1"],
+            "floor":         [0,         0,         1,         0],
+            "room_type":     ["en-suite", "shared-bathroom", "en-suite", "studio"],
+            "is_accessible": [0,         1,         0,         0],
+            "is_available":  [1,         1,         1,         1],
+        }).to_excel(writer, sheet_name="rooms", index=False)
 
         pd.DataFrame({
             "name":  ["Alice Smith"],
