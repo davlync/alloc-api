@@ -1,10 +1,13 @@
 import asyncio
 import csv
 import io
+import math
 import os
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from supabase import create_client, Client
 
 app = FastAPI(title="ChrisTreasurer API")
@@ -23,6 +26,35 @@ def get_supabase() -> Client:
     url = os.environ["SUPABASE_URL"]
     key = os.environ["SUPABASE_SERVICE_KEY"]
     return create_client(url, key)
+
+
+def _safe_str(val) -> str | None:
+    """Return stripped string or None for NaN/empty values."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    return None if s.lower() in ("nan", "none", "null", "") else s
+
+
+def _safe_bool(val) -> bool | None:
+    """Parse 0/1/True/False/NaN to bool or None."""
+    if val is None:
+        return None
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    s = str(val).strip().lower()
+    if s in ("nan", "none", "null", ""):
+        return None
+    return bool(int(float(s)))
+
+
+def _safe_int(val, default: int) -> int:
+    try:
+        if isinstance(val, float) and math.isnan(val):
+            return default
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -313,3 +345,182 @@ async def run_allocation(data: dict = {}):
     }).eq("id", run_id).execute()
 
     return {"run_id": run_id, "status": "complete", "stats": stats, "warnings": warnings}
+
+
+# ── Data upload / template ────────────────────────────────────────────────────
+
+@app.post("/data/upload")
+async def upload_data(file: UploadFile = File(...)):
+    """
+    Accept an xlsx with 3 sheets: students, blocks, wing_leaders.
+    Upserts blocks and students, then pins RA-block assignments.
+
+    Students sheet columns (all except name/email optional):
+      name, email, year, male, accessibility_required, small_room,
+      friend_request_1..4, enemy_request_1..4, block_request_1..2
+
+    Blocks sheet columns:
+      name, block_cap_low, block_cap_up, male_cap_low, male_cap_up, small_room_cap
+
+    Wing leaders sheet columns:
+      name  (must match a student name),  block  (must match a block name)
+    """
+    content = await file.read()
+    try:
+        xl = pd.ExcelFile(io.BytesIO(content))
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid Excel file — must be .xlsx")
+
+    missing = {"students", "blocks", "wing_leaders"} - set(xl.sheet_names)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Missing required sheets: {', '.join(sorted(missing))}",
+        )
+
+    sb = get_supabase()
+
+    # ── 1. Blocks ─────────────────────────────────────────────────────────────
+    df_b = xl.parse("blocks")
+    df_b.columns = [c.strip().lower().replace(" ", "_") for c in df_b.columns]
+
+    block_rows = []
+    for _, row in df_b.iterrows():
+        name = _safe_str(row.get("name"))
+        if not name:
+            continue
+        block_rows.append({
+            "college_id":    COLLEGE_ID,
+            "name":          name,
+            "block_cap_low": float(row.get("block_cap_low", 0.3) or 0.3),
+            "block_cap_up":  float(row.get("block_cap_up",  0.9) or 0.9),
+            "male_cap_low":  float(row.get("male_cap_low",  0.4) or 0.4),
+            "male_cap_up":   float(row.get("male_cap_up",   0.6) or 0.6),
+            "small_room_cap": _safe_int(row.get("small_room_cap", 0), 0),
+        })
+
+    block_name_to_id: dict[str, str] = {}
+    if block_rows:
+        res_b = sb.table("blocks").upsert(block_rows, on_conflict="college_id,name").execute()
+        block_name_to_id = {b["name"]: b["id"] for b in res_b.data}
+
+    # ── 2. Students ───────────────────────────────────────────────────────────
+    df_s = xl.parse("students")
+    df_s.columns = [c.strip().lower().replace(" ", "_") for c in df_s.columns]
+
+    student_rows = []
+    for _, row in df_s.iterrows():
+        name = _safe_str(row.get("name"))
+        if not name:
+            continue
+        email = _safe_str(row.get("email"))
+        if not email:
+            # Generate deterministic placeholder so upsert deduplication still works
+            email = (
+                name.lower()
+                .replace(" ", ".")
+                .replace("'", "")
+                + "@christreasurer.upload"
+            )
+        student_rows.append({
+            "college_id":            COLLEGE_ID,
+            "name":                  name,
+            "email":                 email.lower(),
+            "year":                  _safe_int(row.get("year"), 1),
+            "is_ra":                 False,  # set by wing_leaders processing below
+            "male":                  _safe_bool(row.get("male")),
+            "accessibility_required": bool(_safe_bool(row.get("accessibility_required")) or False),
+            "small_room":            bool(_safe_bool(row.get("small_room")) or False),
+            "friend_request_1":      _safe_str(row.get("friend_request_1")),
+            "friend_request_2":      _safe_str(row.get("friend_request_2")),
+            "friend_request_3":      _safe_str(row.get("friend_request_3")),
+            "friend_request_4":      _safe_str(row.get("friend_request_4")),
+            "enemy_request_1":       _safe_str(row.get("enemy_request_1")),
+            "enemy_request_2":       _safe_str(row.get("enemy_request_2")),
+            "enemy_request_3":       _safe_str(row.get("enemy_request_3")),
+            "enemy_request_4":       _safe_str(row.get("enemy_request_4")),
+            "block_request_1":       _safe_str(row.get("block_request_1")),
+            "block_request_2":       _safe_str(row.get("block_request_2")),
+        })
+
+    student_name_to_id: dict[str, str] = {}
+    if student_rows:
+        res_s = sb.table("students").upsert(
+            student_rows, on_conflict="college_id,email"
+        ).execute()
+        student_name_to_id = {s["name"]: s["id"] for s in res_s.data}
+
+    # ── 3. Wing leaders (RA pins) ─────────────────────────────────────────────
+    df_l = xl.parse("wing_leaders")
+    df_l.columns = [c.strip().lower().replace(" ", "_") for c in df_l.columns]
+
+    ra_count = 0
+    for _, row in df_l.iterrows():
+        ra_name   = _safe_str(row.get("name"))
+        block_name = _safe_str(row.get("block"))
+        if not ra_name or not block_name:
+            continue
+        student_id = student_name_to_id.get(ra_name)
+        block_id   = block_name_to_id.get(block_name)
+        if student_id and block_id:
+            sb.table("students").update({
+                "is_ra":       True,
+                "ra_block_id": block_id,
+            }).eq("id", student_id).execute()
+            ra_count += 1
+
+    return {
+        "blocks_upserted":   len(block_rows),
+        "students_upserted": len(student_rows),
+        "ras_pinned":        ra_count,
+    }
+
+
+@app.get("/data/template")
+def download_template():
+    """Return a blank xlsx template with the correct sheet structure."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame({
+            "name":                  ["Alice Smith"],
+            "email":                 ["alice.smith@college.ac.uk"],
+            "year":                  [1],
+            "male":                  [0],
+            "accessibility_required": [0],
+            "small_room":            [0],
+            "friend_request_1":      ["Bob Jones"],
+            "friend_request_2":      [None],
+            "friend_request_3":      [None],
+            "friend_request_4":      [None],
+            "enemy_request_1":       [None],
+            "enemy_request_2":       [None],
+            "enemy_request_3":       [None],
+            "enemy_request_4":       [None],
+            "block_request_1":       ["Block A"],
+            "block_request_2":       [None],
+        }).to_excel(writer, sheet_name="students", index=False)
+
+        pd.DataFrame({
+            "name":          ["Block A", "Block B"],
+            "block_cap_low": [0.3,       0.3],
+            "block_cap_up":  [0.9,       0.9],
+            "male_cap_low":  [0.4,       0.4],
+            "male_cap_up":   [0.6,       0.6],
+            "small_room_cap":[0,         0],
+        }).to_excel(writer, sheet_name="blocks", index=False)
+
+        pd.DataFrame({
+            "name":  ["Alice Smith"],
+            "block": ["Block A"],
+        }).to_excel(writer, sheet_name="wing_leaders", index=False)
+
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": "attachment; filename=christreasurer_template.xlsx"
+        },
+    )

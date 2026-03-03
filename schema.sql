@@ -15,6 +15,11 @@ create table blocks (
   id uuid primary key default gen_random_uuid(),
   college_id uuid references colleges(id) on delete cascade not null,
   name text not null,
+  block_cap_low   float not null default 0.3,
+  block_cap_up    float not null default 0.9,
+  male_cap_low    float not null default 0.4,
+  male_cap_up     float not null default 0.6,
+  small_room_cap  integer not null default 0,
   created_at timestamptz default now()
 );
 
@@ -40,6 +45,20 @@ create table students (
   year int not null check (year between 1 and 5),
   is_ra boolean not null default false,
   accessibility_required boolean not null default false,
+  -- Algorithm input fields
+  male               boolean,
+  small_room         boolean not null default false,
+  friend_request_1   text,
+  friend_request_2   text,
+  friend_request_3   text,
+  friend_request_4   text,
+  enemy_request_1    text,
+  enemy_request_2    text,
+  enemy_request_3    text,
+  enemy_request_4    text,
+  block_request_1    text,
+  block_request_2    text,
+  ra_block_id        uuid references blocks(id),
   preference_token uuid not null default gen_random_uuid(),
   created_at timestamptz default now(),
   unique(college_id, email)
