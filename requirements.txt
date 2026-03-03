@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 supabase
 python-multipart
+pytest
+httpx
+pytest-asyncio
