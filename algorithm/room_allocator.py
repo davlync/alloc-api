@@ -501,6 +501,7 @@ def _build_and_solve_v3(
 
     return {
         "status":             status,
+        "sol_status":         model.sol_status,
         "objective":          obj,
         "solve_time":         solve_time,
         "alloc":              alloc,
@@ -966,6 +967,7 @@ def build_and_solve(
 
     return {
         "status":             status,
+        "sol_status":         model.sol_status,
         "objective":          obj,
         "solve_time":         solve_time,
         "alloc":              alloc,

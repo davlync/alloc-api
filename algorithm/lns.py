@@ -550,8 +550,11 @@ def lns_solve(df_prefs, df_info, df_ra,
           f"(MIP status: {init_result.get('status', '?')}  "
           f"elapsed: {time.time()-t_start:.1f}s)")
 
-    if init_result.get("status") == "Optimal":
-        print("  [LNS] MIP proved optimal — skipping LNS phase.")
+    # sol_status == 1 means LpSolutionOptimal: SCIP proved global optimality (gap=0).
+    # sol_status == 2 means LpSolutionIntegerFeasible: time-limited, NOT proven optimal.
+    # model.status ("Optimal" string) is unreliable — PuLP sets it to 1 in both cases.
+    if init_result.get("sol_status") == 1:
+        print("  [LNS] MIP proved optimal (sol_status=1) — skipping LNS phase.")
         init_result["lns_iterations"] = 0
         init_result["n_locked"]       = sum(len(c) for c in locked_communities)
         return init_result
