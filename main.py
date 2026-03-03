@@ -530,6 +530,10 @@ def _build_allocation_dataframes(sb, cohort: str, semester_id: str | None):
         prefs_rows.append(row)
     df_prefs = pd.DataFrame(prefs_rows)
 
+    # _assign_pref_weights expects block_request_1..4; DB only has 1..2
+    for k in (3, 4):
+        df_prefs[f"block_request_{k}"] = float("nan")
+
     # Build df_info
     info_rows = []
     for b in blocks_data:
