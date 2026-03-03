@@ -444,7 +444,7 @@ def lns_solve(df_prefs, df_info, df_ra,
               verbose:          bool  = False,
               use_clique_lock:  bool  = False,
               seed:             int   = 42,
-              no_improve_limit: int   = 100,
+              no_improve_limit: int   = 1500,
               **clique_kwargs):
     """
     Large Neighbourhood Search for room allocation.
@@ -553,8 +553,11 @@ def lns_solve(df_prefs, df_info, df_ra,
     # sol_status == 1 means LpSolutionOptimal: SCIP proved global optimality (gap=0).
     # sol_status == 2 means LpSolutionIntegerFeasible: time-limited, NOT proven optimal.
     # model.status ("Optimal" string) is unreliable — PuLP sets it to 1 in both cases.
+    init_gap = init_result.get("mip_gap", float("nan"))
     if init_result.get("sol_status") == 1:
-        print("  [LNS] MIP proved optimal (sol_status=1) — skipping LNS phase.")
+        print(f"  [LNS] MIP proved optimal — skipping LNS phase. "
+              f"Objective: {best_obj:.3f}  Gap: 0.00%  "
+              f"Elapsed: {time.time()-t_start:.1f}s")
         init_result["lns_iterations"] = 0
         init_result["n_locked"]       = sum(len(c) for c in locked_communities)
         return init_result
@@ -566,13 +569,15 @@ def lns_solve(df_prefs, df_info, df_ra,
     op_counts   = {"random": 0, "block": 0}
     op_wins     = {"random": 0, "block": 0}
 
+    stop_reason = "time_limit"
     while True:
         elapsed   = time.time() - t_start
         remaining = time_limit - elapsed
         if remaining < repair_time + 0.5:
+            stop_reason = "time_limit"
             break
         if no_improve_limit > 0 and iters_no_improve >= no_improve_limit:
-            print(f"  [LNS] Early stop: no improvement for {iters_no_improve} iterations.")
+            stop_reason = "no_improve"
             break
 
         this_repair = min(repair_time, remaining - 0.5)
@@ -629,9 +634,14 @@ def lns_solve(df_prefs, df_info, df_ra,
 
         iteration += 1
 
-    total_time = time.time() - t_start
-    print(f"\n[LNS] Done.  {iteration} iterations, {improvements} improvements, "
-          f"{total_time:.1f}s total.  Best obj: {best_obj:.3f}")
+    total_time  = time.time() - t_start
+    gap_str = f"{init_gap:.2%}" if init_gap == init_gap else "n/a"
+    reason_str = ("no improvement for "
+                  f"{iters_no_improve} iters" if stop_reason == "no_improve"
+                  else f"time limit ({time_limit}s)")
+    print(f"\n[LNS] Done ({reason_str}).  "
+          f"{iteration} iters, {improvements} improvements, {total_time:.1f}s.  "
+          f"Best obj: {best_obj:.3f}  Initial MIP gap: {gap_str}")
 
     # ── Return result in build_and_solve format ───────────────────────────
     # Patch the initial result with the best alloc found

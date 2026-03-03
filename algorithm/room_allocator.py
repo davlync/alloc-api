@@ -416,8 +416,13 @@ def _build_and_solve_v3(
 
     status = pulp.LpStatus[model.status]
     obj    = pulp.value(model.objective) or 0.0
-    print(f"\nStatus:    {status}")
-    print(f"Objective: {obj:.2f}")
+    try:
+        mip_gap = model.solverModel.getGap()
+    except Exception:
+        mip_gap = float("nan")
+    print(f"\nStatus:    {status}  (sol_status={model.sol_status})")
+    print(f"Objective: {obj:.2f}  MIP gap: {mip_gap:.2%}" if mip_gap == mip_gap else
+          f"Objective: {obj:.2f}  MIP gap: n/a")
     print(f"Solve time: {solve_time:.2f}s")
 
     # ── Slack diagnostics ──────────────────────────────────────
@@ -502,6 +507,7 @@ def _build_and_solve_v3(
     return {
         "status":             status,
         "sol_status":         model.sol_status,
+        "mip_gap":            mip_gap,
         "objective":          obj,
         "solve_time":         solve_time,
         "alloc":              alloc,
@@ -876,8 +882,13 @@ def build_and_solve(
 
     status = pulp.LpStatus[model.status]
     obj    = pulp.value(model.objective) or 0.0
-    print(f"\nStatus:    {status}")
-    print(f"Objective: {obj:.2f}")
+    try:
+        mip_gap = model.solverModel.getGap()
+    except Exception:
+        mip_gap = float("nan")
+    print(f"\nStatus:    {status}  (sol_status={model.sol_status})")
+    print(f"Objective: {obj:.2f}  MIP gap: {mip_gap:.2%}" if mip_gap == mip_gap else
+          f"Objective: {obj:.2f}  MIP gap: n/a")
     print(f"Solve time: {solve_time:.2f}s")
 
     # ── Slack diagnostics ──────────────────────────────────────
@@ -968,6 +979,7 @@ def build_and_solve(
     return {
         "status":             status,
         "sol_status":         model.sol_status,
+        "mip_gap":            mip_gap,
         "objective":          obj,
         "solve_time":         solve_time,
         "alloc":              alloc,
