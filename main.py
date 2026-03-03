@@ -722,6 +722,25 @@ def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time
             block_uuid_to_int, int_to_block_uuid,
         ) = _build_allocation_dataframes(sb, cohort, semester_id)
 
+        # ── Diagnostic summary ────────────────────────────────────────────────
+        total_capacity = int(df_info["capacity"].sum())
+        n_students     = len(df_prefs)
+        n_males        = int(df_prefs["male"].sum())
+        n_ras          = len(df_ra)
+        print(f"\n[run diagnostic]")
+        print(f"  students  : {n_students}  (cohort={cohort})")
+        print(f"  blocks    : {len(df_info)}  total_capacity={total_capacity}")
+        print(f"  males     : {n_males}/{n_students}")
+        print(f"  RAs       : {n_ras}")
+        for _, row in df_info.iterrows():
+            print(f"  block {int(row['block'])}: cap={int(row['capacity'])}  "
+                  f"cap_low={row['block_cap_low']:.2f}  cap_up={row['block_cap_up']:.2f}  "
+                  f"male_low={row['male_cap_low']:.2f}  male_up={row['male_cap_up']:.2f}  "
+                  f"small_cap={int(row['small_room_cap'])}")
+        if total_capacity < n_students:
+            print(f"  *** INFEASIBLE: total_capacity ({total_capacity}) < n_students ({n_students})")
+        print()
+
         # Assign preference weight columns expected by the solver
         from algorithm.room_allocator import _assign_pref_weights
         _assign_pref_weights(df_prefs)
