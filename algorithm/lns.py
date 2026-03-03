@@ -436,14 +436,15 @@ def _repair(df_prefs, df_info, df_ra,
 # ── Main LNS entry point ──────────────────────────────────────────────────────
 
 def lns_solve(df_prefs, df_info, df_ra,
-              time_limit:      int   = 30,
-              solver_name:     str   = "SCIP",
-              initial_time:    int   = 8,
-              repair_time:     int   = 4,
-              destroy_frac:    float = 0.25,
-              verbose:         bool  = False,
-              use_clique_lock: bool  = False,
-              seed:            int   = 42,
+              time_limit:       int   = 30,
+              solver_name:      str   = "SCIP",
+              initial_time:     int   = 8,
+              repair_time:      int   = 4,
+              destroy_frac:     float = 0.25,
+              verbose:          bool  = False,
+              use_clique_lock:  bool  = False,
+              seed:             int   = 42,
+              no_improve_limit: int   = 100,
               **clique_kwargs):
     """
     Large Neighbourhood Search for room allocation.
@@ -549,9 +550,16 @@ def lns_solve(df_prefs, df_info, df_ra,
           f"(MIP status: {init_result.get('status', '?')}  "
           f"elapsed: {time.time()-t_start:.1f}s)")
 
+    if init_result.get("status") == "Optimal":
+        print("  [LNS] MIP proved optimal — skipping LNS phase.")
+        init_result["lns_iterations"] = 0
+        init_result["n_locked"]       = sum(len(c) for c in locked_communities)
+        return init_result
+
     # ── Phase 2: LNS loop ─────────────────────────────────────────────────
-    iteration   = 0
-    improvements = 0
+    iteration          = 0
+    improvements       = 0
+    iters_no_improve   = 0
     op_counts   = {"random": 0, "block": 0}
     op_wins     = {"random": 0, "block": 0}
 
@@ -559,6 +567,9 @@ def lns_solve(df_prefs, df_info, df_ra,
         elapsed   = time.time() - t_start
         remaining = time_limit - elapsed
         if remaining < repair_time + 0.5:
+            break
+        if no_improve_limit > 0 and iters_no_improve >= no_improve_limit:
+            print(f"  [LNS] Early stop: no improvement for {iters_no_improve} iterations.")
             break
 
         this_repair = min(repair_time, remaining - 0.5)
@@ -602,11 +613,16 @@ def lns_solve(df_prefs, df_info, df_ra,
             current_alloc = new_alloc
             current_obj   = new_obj
             if new_obj > best_obj + 1e-6:
-                best_alloc   = dict(new_alloc)
-                best_obj     = new_obj
-                op_wins[op] += 1
-                improvements += 1
+                best_alloc       = dict(new_alloc)
+                best_obj         = new_obj
+                op_wins[op]     += 1
+                improvements     += 1
+                iters_no_improve  = 0
                 print(f"    ✓ improved to {best_obj:.3f}")
+            else:
+                iters_no_improve += 1
+        else:
+            iters_no_improve += 1
 
         iteration += 1
 
