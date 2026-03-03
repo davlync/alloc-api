@@ -759,24 +759,35 @@ def _build_allocation_dataframes(sb, cohort: str, semester_id: str | None):
     for k in (3, 4):
         df_prefs[f"block_request_{k}"] = float("nan")
 
-    # Gender ratio: if fewer than 10% of students have male explicitly set,
-    # disable the bounds (0/1) to avoid infeasibility from missing data.
+    # Gender ratio: disable bounds if data is sparse.
+    # When RA pins are present, widen bounds by 0.15 per side to absorb the
+    # degrees-of-freedom lost to pinning (RA pins are hard and can push individual
+    # blocks outside tight bounds, making the MIP infeasible).
     n_male = sum(1 for s in students_data if s.get("male"))
+    n_ra   = sum(1 for s in students_data if s.get("is_ra") and s.get("ra_block_id"))
     gender_data_available = n_male / len(students_data) >= 0.1 if students_data else False
+    # Extra tolerance when many hard RA pins reduce the solver's gender flexibility
+    gender_tolerance = min(0.15, 0.05 * n_ra / max(len(blocks_data), 1)) if n_ra > 0 else 0.0
     print(f"  [run] {n_male}/{len(students_data)} students have male=true; "
-          f"gender constraints {'enabled' if gender_data_available else 'DISABLED (sparse data)'}")
+          f"gender constraints {'enabled' if gender_data_available else 'DISABLED (sparse data)'}; "
+          f"ra_pins={n_ra}  gender_tolerance={gender_tolerance:.3f}")
 
     # Build df_info
     info_rows = []
     for b in blocks_data:
         n_rooms = len(rooms_by_block.get(b["id"], []))
+        if gender_data_available:
+            m_low = max(0.0, float(b.get("male_cap_low") or 0.4) - gender_tolerance)
+            m_up  = min(1.0, float(b.get("male_cap_up")  or 0.6) + gender_tolerance)
+        else:
+            m_low, m_up = 0.0, 1.0
         info_rows.append({
             "block":         block_uuid_to_int[b["id"]],
             "capacity":      n_rooms,
             "block_cap_low": float(b.get("block_cap_low") or 0.3),
             "block_cap_up":  float(b.get("block_cap_up")  or 0.9),
-            "male_cap_low":  float(b.get("male_cap_low") or 0.4) if gender_data_available else 0.0,
-            "male_cap_up":   float(b.get("male_cap_up")  or 0.6) if gender_data_available else 1.0,
+            "male_cap_low":  m_low,
+            "male_cap_up":   m_up,
             "small_room_cap":int(b.get("small_room_cap")  or 0),
         })
     df_info = pd.DataFrame(info_rows)
