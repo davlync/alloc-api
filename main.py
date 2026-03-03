@@ -913,6 +913,7 @@ def _compute_run_stats(alloc_int: dict, df_prefs: pd.DataFrame, students_data: l
 
     # Hard constraint violations — students with preferences but none satisfied
     n_no_pref_met = 0
+    violating_student_ints: list[int] = []
     for _, row in df_prefs.iterrows():
         si = int(row["student"])
         my_block = alloc_int.get(si)
@@ -937,6 +938,7 @@ def _compute_run_stats(alloc_int: dict, df_prefs: pd.DataFrame, students_data: l
                     any_met = True
         if has_prefs and not any_met:
             n_no_pref_met += 1
+            violating_student_ints.append(si)
 
     return {
         "students_assigned_pct":          round(n_assigned / n_students * 100) if n_students > 0 else 0,
@@ -944,6 +946,7 @@ def _compute_run_stats(alloc_int: dict, df_prefs: pd.DataFrame, students_data: l
         "room_type_preferences_met_pct":  0,  # room-level preference tracking not yet implemented
         "block_preferences_met_pct":      block_pct,
         "hard_constraint_violations":     n_no_pref_met,
+        "_violating_student_ints":        violating_student_ints,  # popped before DB write
     }
 
 
@@ -1015,6 +1018,7 @@ def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time
 
         # Compute stats and warnings
         stats    = _compute_run_stats(alloc_int, df_prefs, students_data)
+        violating_ints: list[int] = stats.pop("_violating_student_ints", [])
         warnings: list[str] = []
         n_unassigned = len(students_data) - len(alloc_int)
         if n_unassigned > 0:
@@ -1022,9 +1026,16 @@ def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time
         n_flagged = sum(1 for _, _, f, _ in assignments if f)
         if n_flagged:
             warnings.append(f"{n_flagged} student(s) have allocation flags (see Results page)")
-        if stats["hard_constraint_violations"] > 0:
+        if violating_ints:
+            student_int_to_name = {
+                student_uuid_to_int[s["id"]]: s["name"]
+                for s in students_data
+                if s["id"] in student_uuid_to_int
+            }
+            names = [student_int_to_name.get(si, f"student #{si}") for si in violating_ints]
             warnings.append(
-                f"{stats['hard_constraint_violations']} student(s) had preferences but none were satisfied"
+                f"{len(names)} student(s) had preferences but none were satisfied: "
+                + ", ".join(names)
             )
 
         sb.table("allocation_runs").update({
