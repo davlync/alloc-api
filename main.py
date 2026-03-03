@@ -468,7 +468,9 @@ async def upload_data(
       friend_request_1..4, enemy_request_1..4, block_request_1..2
 
     Blocks sheet columns:
-      name, block_cap_low, block_cap_up, male_cap_low, male_cap_up, small_room_cap
+      name, block_cap_low, block_cap_up, male_cap_low, male_cap_up, small_room_cap,
+      num_rooms (optional — auto-generates rooms if no rooms sheet),
+      default_room_type (optional — en-suite/shared-bathroom/studio, default en-suite)
 
     Rooms sheet columns (optional — replaces rooms for processed blocks):
       block (name), room_number, floor, room_type, is_accessible, is_available
@@ -491,11 +493,15 @@ async def upload_data(
 
     sb = get_supabase()
 
+    valid_room_types = {"en-suite", "shared-bathroom", "studio"}
+
     # ── 1. Blocks ─────────────────────────────────────────────────────────────
     df_b = xl.parse("blocks")
     df_b.columns = [c.strip().lower().replace(" ", "_") for c in df_b.columns]
 
     block_rows = []
+    # Track num_rooms / default_room_type per block name for auto-generation
+    block_auto_rooms: dict[str, tuple[int, str]] = {}
     for _, row in df_b.iterrows():
         name = _safe_str(row.get("name"))
         if not name:
@@ -513,6 +519,13 @@ async def upload_data(
             entry["semester_id"] = semester_id
         block_rows.append(entry)
 
+        num_rooms = _safe_int(row.get("num_rooms", 0), 0)
+        if num_rooms > 0:
+            default_type = _safe_str(row.get("default_room_type")) or "en-suite"
+            if default_type not in valid_room_types:
+                default_type = "en-suite"
+            block_auto_rooms[name] = (num_rooms, default_type)
+
     block_name_to_id: dict[str, str] = {}
     if block_rows:
         res_b = sb.table("blocks").upsert(
@@ -520,16 +533,42 @@ async def upload_data(
         ).execute()
         block_name_to_id = {b["name"]: b["id"] for b in res_b.data}
 
-    # ── 2. Rooms (optional sheet) ─────────────────────────────────────────────
+    # ── 2. Rooms (auto-generated from num_rooms, overridden by explicit sheet) ──
     rooms_upserted = 0
+
+    def _make_room(block_id: str, room_number: str, floor: int,
+                   room_type: str, accessible: bool) -> dict:
+        entry = {
+            "college_id":    COLLEGE_ID,
+            "block_id":      block_id,
+            "room_number":   room_number,
+            "floor":         floor,
+            "room_type":     room_type,
+            "is_accessible": accessible,
+            "is_available":  True,
+        }
+        if semester_id:
+            entry["semester_id"] = semester_id
+        return entry
+
+    # Start with auto-generated rooms (from num_rooms column on blocks sheet)
+    rooms_by_block: dict[str, list] = {}
+    for block_name, (num_rooms, default_type) in block_auto_rooms.items():
+        block_id = block_name_to_id.get(block_name)
+        if not block_id:
+            continue
+        m = re.search(r"\d+", block_name)
+        prefix = m.group() if m else re.sub(r"\s+", "", block_name)[:3].upper()
+        rooms_by_block[block_id] = [
+            _make_room(block_id, f"{prefix}-{i}", 0, default_type, False)
+            for i in range(1, num_rooms + 1)
+        ]
+
+    # Explicit rooms sheet wins per block — replaces any auto-generated rooms
     if "rooms" in xl.sheet_names and block_name_to_id:
         df_r = xl.parse("rooms")
         df_r.columns = [c.strip().lower().replace(" ", "_") for c in df_r.columns]
-
-        valid_room_types = {"en-suite", "shared-bathroom", "studio"}
-
-        # Group rows by block so we can delete-then-insert per block
-        rooms_by_block: dict[str, list] = {}
+        explicit_by_block: dict[str, list] = {}
         for _, row in df_r.iterrows():
             block_name = _safe_str(row.get("block"))
             room_number = _safe_str(row.get("room_number"))
@@ -541,25 +580,21 @@ async def upload_data(
             room_type = _safe_str(row.get("room_type")) or "en-suite"
             if room_type not in valid_room_types:
                 room_type = "en-suite"
-            entry = {
-                "college_id":   COLLEGE_ID,
-                "block_id":     block_id,
-                "room_number":  room_number,
-                "floor":        _safe_int(row.get("floor"), 0),
-                "room_type":    room_type,
-                "is_accessible": bool(_safe_bool(row.get("is_accessible")) or False),
-                "is_available":  bool(_safe_bool(row.get("is_available")) if row.get("is_available") is not None else True),
-            }
-            if semester_id:
-                entry["semester_id"] = semester_id
-            rooms_by_block.setdefault(block_id, []).append(entry)
+            explicit_by_block.setdefault(block_id, []).append(
+                _make_room(
+                    block_id, room_number,
+                    _safe_int(row.get("floor"), 0),
+                    room_type,
+                    bool(_safe_bool(row.get("is_accessible")) or False),
+                )
+            )
+        rooms_by_block.update(explicit_by_block)  # explicit overrides per block
 
+    if rooms_by_block:
         for block_id, room_rows in rooms_by_block.items():
-            # Delete existing rooms for this block before re-inserting
             sb.table("rooms").delete().eq("block_id", block_id).execute()
-            if room_rows:
-                sb.table("rooms").insert(room_rows).execute()
-                rooms_upserted += len(room_rows)
+            sb.table("rooms").insert(room_rows).execute()
+            rooms_upserted += len(room_rows)
 
     # ── 3. Students ───────────────────────────────────────────────────────────
     df_s = xl.parse("students")
@@ -661,12 +696,14 @@ def download_template():
         }).to_excel(writer, sheet_name="students", index=False)
 
         pd.DataFrame({
-            "name":          ["Block A", "Block B"],
-            "block_cap_low": [0.3,       0.3],
-            "block_cap_up":  [0.9,       0.9],
-            "male_cap_low":  [0.4,       0.4],
-            "male_cap_up":   [0.6,       0.6],
-            "small_room_cap":[0,         0],
+            "name":              ["Block A", "Block B"],
+            "block_cap_low":     [0.3,       0.3],
+            "block_cap_up":      [0.9,       0.9],
+            "male_cap_low":      [0.4,       0.4],
+            "male_cap_up":       [0.6,       0.6],
+            "small_room_cap":    [0,         0],
+            "num_rooms":         [20,        15],
+            "default_room_type": ["en-suite", "shared-bathroom"],
         }).to_excel(writer, sheet_name="blocks", index=False)
 
         pd.DataFrame({
