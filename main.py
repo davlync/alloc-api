@@ -534,6 +534,13 @@ def _build_allocation_dataframes(sb, cohort: str, semester_id: str | None):
     for k in (3, 4):
         df_prefs[f"block_request_{k}"] = float("nan")
 
+    # Gender ratio: if fewer than 10% of students have male explicitly set,
+    # disable the bounds (0/1) to avoid infeasibility from missing data.
+    n_male = sum(1 for s in students_data if s.get("male"))
+    gender_data_available = n_male / len(students_data) >= 0.1 if students_data else False
+    print(f"  [run] {n_male}/{len(students_data)} students have male=true; "
+          f"gender constraints {'enabled' if gender_data_available else 'DISABLED (sparse data)'}")
+
     # Build df_info
     info_rows = []
     for b in blocks_data:
@@ -543,8 +550,8 @@ def _build_allocation_dataframes(sb, cohort: str, semester_id: str | None):
             "capacity":      n_rooms,
             "block_cap_low": float(b.get("block_cap_low") or 0.3),
             "block_cap_up":  float(b.get("block_cap_up")  or 0.9),
-            "male_cap_low":  float(b.get("male_cap_low")  or 0.4),
-            "male_cap_up":   float(b.get("male_cap_up")   or 0.6),
+            "male_cap_low":  float(b.get("male_cap_low") or 0.4) if gender_data_available else 0.0,
+            "male_cap_up":   float(b.get("male_cap_up")  or 0.6) if gender_data_available else 1.0,
             "small_room_cap":int(b.get("small_room_cap")  or 0),
         })
     df_info = pd.DataFrame(info_rows)
