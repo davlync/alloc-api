@@ -1018,14 +1018,52 @@ def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time
             rooms_by_block, students_data,
         )
 
+        # ── Per-student quality fields ────────────────────────────────────────
+        _RW = {1: 4, 2: 3, 3: 2, 4: 1}
+        student_uuid_to_quality: dict[str, dict] = {}
+        for _, row in df_prefs.iterrows():
+            si       = int(row["student"])
+            my_block = alloc_int.get(si)
+            if my_block is None:
+                continue
+            s_uuid_q = int_to_student_uuid.get(si)
+            if not s_uuid_q:
+                continue
+
+            # Block match: None = no pref, True/False = pref existed
+            block_reqs = [row.get(f"block_request_{k}") for k in (1, 2)]
+            block_reqs = [int(v) for v in block_reqs if not pd.isna(v)]
+            if block_reqs:
+                block_matched_q = my_block in block_reqs
+            else:
+                block_matched_q = None
+
+            # Friend score: None = no prefs, 0-100 otherwise
+            max_w = achieved_w = 0
+            for k in range(1, 5):
+                fv = row.get(f"friend_request_{k}")
+                if not pd.isna(fv):
+                    w = _RW[k]
+                    max_w += w
+                    if alloc_int.get(int(fv)) == my_block:
+                        achieved_w += w
+            friend_score_q = round(achieved_w / max_w * 100) if max_w > 0 else None
+
+            student_uuid_to_quality[s_uuid_q] = {
+                "block_matched":    block_matched_q,
+                "friend_score_pct": friend_score_q,
+            }
+
         # Insert allocation rows
         alloc_rows = [
             {
-                "run_id":      run_id,
-                "student_id":  s_uuid,
-                "room_id":     r_uuid,
-                "is_flagged":  is_flagged,
-                "flag_reason": flag_reason,
+                "run_id":           run_id,
+                "student_id":       s_uuid,
+                "room_id":          r_uuid,
+                "is_flagged":       is_flagged,
+                "flag_reason":      flag_reason,
+                "block_matched":    student_uuid_to_quality.get(s_uuid, {}).get("block_matched"),
+                "friend_score_pct": student_uuid_to_quality.get(s_uuid, {}).get("friend_score_pct"),
             }
             for s_uuid, r_uuid, is_flagged, flag_reason in assignments
             if r_uuid is not None
