@@ -1,13 +1,14 @@
-import asyncio
 import csv
 import io
 import math
 import os
+import random
 import re
+import traceback
 from datetime import datetime, timezone
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Form
+from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from supabase import create_client, Client
@@ -414,43 +415,385 @@ def get_run(run_id: str):
     return {**run.data, "allocations": allocations.data}
 
 
-@app.post("/run")
-async def run_allocation(data: dict = {}):
+@app.get("/runs/{run_id}/status")
+def get_run_status(run_id: str):
+    """Lightweight poll endpoint — returns run row only, no allocations join."""
     sb = get_supabase()
-    cohort = data.get("cohort", "first-years")
+    run = (
+        sb.table("allocation_runs")
+        .select("*")
+        .eq("id", run_id)
+        .single()
+        .execute()
+    )
+    if not run.data:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run.data
+
+
+# ── Allocation algorithm helpers ──────────────────────────────────────────────
+
+def _build_allocation_dataframes(sb, cohort: str, semester_id: str | None):
+    """Pull students, blocks, rooms from DB and build algorithm DataFrames."""
+
+    # Blocks
+    q_blocks = sb.table("blocks").select("*").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q_blocks = q_blocks.eq("semester_id", semester_id)
+    else:
+        q_blocks = q_blocks.is_("semester_id", "null")
+    blocks_data = q_blocks.execute().data
+    if not blocks_data:
+        raise ValueError("No blocks found for this semester")
+
+    block_uuids = [b["id"] for b in blocks_data]
+
+    # Rooms grouped by block (only available rooms count as capacity)
+    rooms_data = (
+        sb.table("rooms")
+        .select("*")
+        .eq("college_id", COLLEGE_ID)
+        .in_("block_id", block_uuids)
+        .eq("is_available", True)
+        .execute()
+        .data
+    )
+    rooms_by_block: dict[str, list] = {b["id"]: [] for b in blocks_data}
+    for room in rooms_data:
+        bid = room["block_id"]
+        if bid in rooms_by_block:
+            rooms_by_block[bid].append(room)
+
+    # Students
+    q_students = sb.table("students").select("*").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q_students = q_students.eq("semester_id", semester_id)
+    else:
+        q_students = q_students.is_("semester_id", "null")
+    if cohort == "first-years":
+        q_students = q_students.eq("year", 1)
+    students_data = q_students.execute().data
+    if not students_data:
+        raise ValueError("No students found for this cohort/semester")
+
+    # UUID ↔ int mappings (sequential integers)
+    student_uuid_to_int = {s["id"]: i for i, s in enumerate(students_data)}
+    int_to_student_uuid = {i: s["id"] for i, s in enumerate(students_data)}
+    block_uuid_to_int   = {b["id"]: i for i, b in enumerate(blocks_data)}
+    int_to_block_uuid   = {i: b["id"] for i, b in enumerate(blocks_data)}
+
+    # Name → UUID lookups (friend/block requests stored as names in DB)
+    student_name_to_uuid: dict[str, str] = {
+        s["name"].strip().lower(): s["id"] for s in students_data
+    }
+    block_name_to_uuid: dict[str, str] = {
+        b["name"].strip().lower(): b["id"] for b in blocks_data
+    }
+
+    def _resolve_friend(name_val) -> float:
+        if name_val is None:
+            return float("nan")
+        if isinstance(name_val, float) and math.isnan(name_val):
+            return float("nan")
+        uuid = student_name_to_uuid.get(str(name_val).strip().lower())
+        if uuid is None:
+            return float("nan")
+        idx = student_uuid_to_int.get(uuid)
+        return float(idx) if idx is not None else float("nan")
+
+    def _resolve_block(name_val) -> float:
+        if name_val is None:
+            return float("nan")
+        if isinstance(name_val, float) and math.isnan(name_val):
+            return float("nan")
+        uuid = block_name_to_uuid.get(str(name_val).strip().lower())
+        if uuid is None:
+            return float("nan")
+        idx = block_uuid_to_int.get(uuid)
+        return float(idx) if idx is not None else float("nan")
+
+    # Build df_prefs
+    prefs_rows = []
+    for s in students_data:
+        is_ra = bool(s.get("is_ra"))
+        row: dict = {
+            "student":        student_uuid_to_int[s["id"]],
+            "male":           1 if s.get("male") else 0,
+            "community_mult": 0.0 if is_ra else float(s.get("community_mult") or 0.1),
+            "small_room":     1 if s.get("small_room") else 0,
+        }
+        for k in range(1, 5):
+            row[f"friend_request_{k}"] = _resolve_friend(s.get(f"friend_request_{k}"))
+            row[f"enemy_request_{k}"]  = _resolve_friend(s.get(f"enemy_request_{k}"))
+        for k in range(1, 3):
+            row[f"block_request_{k}"] = _resolve_block(s.get(f"block_request_{k}"))
+        prefs_rows.append(row)
+    df_prefs = pd.DataFrame(prefs_rows)
+
+    # Build df_info
+    info_rows = []
+    for b in blocks_data:
+        n_rooms = len(rooms_by_block.get(b["id"], []))
+        info_rows.append({
+            "block":         block_uuid_to_int[b["id"]],
+            "capacity":      n_rooms,
+            "block_cap_low": float(b.get("block_cap_low") or 0.3),
+            "block_cap_up":  float(b.get("block_cap_up")  or 0.9),
+            "male_cap_low":  float(b.get("male_cap_low")  or 0.4),
+            "male_cap_up":   float(b.get("male_cap_up")   or 0.6),
+            "small_room_cap":int(b.get("small_room_cap")  or 0),
+        })
+    df_info = pd.DataFrame(info_rows)
+
+    # Build df_ra (RAs with an assigned block)
+    ra_rows = []
+    for s in students_data:
+        if s.get("is_ra") and s.get("ra_block_id"):
+            ra_block_uuid = s["ra_block_id"]
+            if ra_block_uuid in block_uuid_to_int:
+                ra_rows.append({
+                    "ra":    student_uuid_to_int[s["id"]],
+                    "block": block_uuid_to_int[ra_block_uuid],
+                })
+    df_ra = pd.DataFrame(ra_rows if ra_rows else [{"ra": 0, "block": 0}])
+    df_ra = df_ra.astype(int)
+    if not ra_rows:
+        df_ra = df_ra.iloc[0:0]  # empty with correct dtypes
+
+    return (
+        df_prefs, df_info, df_ra,
+        students_data, blocks_data, rooms_by_block,
+        student_uuid_to_int, int_to_student_uuid,
+        block_uuid_to_int, int_to_block_uuid,
+    )
+
+
+def _assign_rooms(
+    alloc_int: dict,
+    int_to_student_uuid: dict,
+    int_to_block_uuid: dict,
+    rooms_by_block: dict,
+    students_data: list,
+) -> list[tuple]:
+    """
+    Translate int alloc → UUIDs, then pick a room per student in their block.
+    Prioritises accessible rooms for accessibility_required students, and
+    shared-bathroom rooms for small_room students.  Otherwise random.
+    Returns list of (student_uuid, room_uuid, is_flagged, flag_reason).
+    """
+    student_by_uuid = {s["id"]: s for s in students_data}
+
+    # Per-block mutable list of available rooms (we pop as we assign)
+    available: dict[str, list] = {}
+    for block_uuid, rooms in rooms_by_block.items():
+        available[block_uuid] = list(rooms)  # copy so we can pop
+
+    assignments = []
+    for student_int, block_int in alloc_int.items():
+        student_uuid = int_to_student_uuid[student_int]
+        block_uuid   = int_to_block_uuid[block_int]
+        student      = student_by_uuid[student_uuid]
+
+        room_pool = available.get(block_uuid, [])
+        if not room_pool:
+            assignments.append((student_uuid, None, True, "No available room in assigned block"))
+            continue
+
+        wants_accessible = bool(student.get("accessibility_required"))
+        wants_small      = bool(student.get("small_room"))
+
+        def _priority(r):
+            score = 0
+            if wants_accessible and r.get("is_accessible"):
+                score += 4
+            if wants_small and r.get("room_type") == "shared-bathroom":
+                score += 2
+            score += random.random()  # tiebreak
+            return -score  # sort ascending (highest priority first)
+
+        room_pool.sort(key=_priority)
+        chosen = room_pool.pop(0)
+
+        is_flagged  = wants_accessible and not chosen.get("is_accessible")
+        flag_reason = "No accessible room available in assigned block" if is_flagged else None
+        assignments.append((student_uuid, chosen["id"], is_flagged, flag_reason))
+
+    return assignments
+
+
+def _compute_run_stats(alloc_int: dict, df_prefs: pd.DataFrame, students_data: list) -> dict:
+    """Compute stats dict for the allocation run."""
+    n_students = len(students_data)
+    n_assigned  = len(alloc_int)
+
+    # Friend preferences matched (friend in same block)
+    total_friend_reqs = 0
+    friend_matched    = 0
+    for _, row in df_prefs.iterrows():
+        si = int(row["student"])
+        my_block = alloc_int.get(si)
+        if my_block is None:
+            continue
+        for k in range(1, 5):
+            fv = row.get(f"friend_request_{k}")
+            if pd.isna(fv):
+                continue
+            total_friend_reqs += 1
+            if alloc_int.get(int(fv)) == my_block:
+                friend_matched += 1
+
+    friend_pct = round(friend_matched / total_friend_reqs * 100) if total_friend_reqs > 0 else 100
+
+    # Block preferences matched
+    total_block_prefs = 0
+    block_pref_met    = 0
+    for _, row in df_prefs.iterrows():
+        si = int(row["student"])
+        my_block = alloc_int.get(si)
+        if my_block is None:
+            continue
+        if float(row.get("community_mult", 0.1)) < 0.01:
+            continue  # RA — skip
+        for k in range(1, 3):
+            bv = row.get(f"block_request_{k}")
+            if pd.isna(bv):
+                continue
+            total_block_prefs += 1
+            if int(bv) == my_block:
+                block_pref_met += 1
+
+    block_pct = round(block_pref_met / total_block_prefs * 100) if total_block_prefs > 0 else 100
+
+    # Hard constraint violations — students with preferences but none satisfied
+    n_no_pref_met = 0
+    for _, row in df_prefs.iterrows():
+        si = int(row["student"])
+        my_block = alloc_int.get(si)
+        if my_block is None:
+            continue
+        cm = float(row.get("community_mult", 0.1))
+        if cm < 0.01:
+            continue
+        has_prefs = False
+        any_met   = False
+        for k in range(1, 5):
+            fv = row.get(f"friend_request_{k}")
+            if not pd.isna(fv):
+                has_prefs = True
+                if alloc_int.get(int(fv)) == my_block:
+                    any_met = True
+        for k in range(1, 3):
+            bv = row.get(f"block_request_{k}")
+            if not pd.isna(bv):
+                has_prefs = True
+                if int(bv) == my_block:
+                    any_met = True
+        if has_prefs and not any_met:
+            n_no_pref_met += 1
+
+    return {
+        "students_assigned_pct":          round(n_assigned / n_students * 100) if n_students > 0 else 0,
+        "friend_requests_matched_pct":    friend_pct,
+        "room_type_preferences_met_pct":  0,  # room-level preference tracking not yet implemented
+        "block_preferences_met_pct":      block_pct,
+        "hard_constraint_violations":     n_no_pref_met,
+    }
+
+
+def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time_limit: int):
+    """Background task: run the SCIP/LNS allocation and write results to DB."""
+    sb = get_supabase()
+    try:
+        (
+            df_prefs, df_info, df_ra,
+            students_data, blocks_data, rooms_by_block,
+            student_uuid_to_int, int_to_student_uuid,
+            block_uuid_to_int, int_to_block_uuid,
+        ) = _build_allocation_dataframes(sb, cohort, semester_id)
+
+        # Assign preference weight columns expected by the solver
+        from algorithm.room_allocator import _assign_pref_weights
+        _assign_pref_weights(df_prefs)
+
+        # Run LNS solver
+        from algorithm.lns import lns_solve
+        result = lns_solve(
+            df_prefs, df_info, df_ra,
+            time_limit=time_limit,
+            solver_name="SCIP",
+            verbose=False,
+        )
+
+        alloc_int: dict = result.get("alloc", {})
+
+        # Assign rooms
+        assignments = _assign_rooms(
+            alloc_int, int_to_student_uuid, int_to_block_uuid,
+            rooms_by_block, students_data,
+        )
+
+        # Insert allocation rows
+        alloc_rows = [
+            {
+                "run_id":      run_id,
+                "student_id":  s_uuid,
+                "room_id":     r_uuid,
+                "is_flagged":  is_flagged,
+                "flag_reason": flag_reason,
+            }
+            for s_uuid, r_uuid, is_flagged, flag_reason in assignments
+            if r_uuid is not None
+        ]
+        if alloc_rows:
+            sb.table("allocations").insert(alloc_rows).execute()
+
+        # Compute stats and warnings
+        stats    = _compute_run_stats(alloc_int, df_prefs, students_data)
+        warnings: list[str] = []
+        n_unassigned = len(students_data) - len(alloc_int)
+        if n_unassigned > 0:
+            warnings.append(f"{n_unassigned} student(s) could not be assigned a block")
+        n_flagged = sum(1 for _, _, f, _ in assignments if f)
+        if n_flagged:
+            warnings.append(f"{n_flagged} student(s) have allocation flags (see Results page)")
+        if stats["hard_constraint_violations"] > 0:
+            warnings.append(
+                f"{stats['hard_constraint_violations']} student(s) had preferences but none were satisfied"
+            )
+
+        sb.table("allocation_runs").update({
+            "status":       "complete",
+            "stats":        stats,
+            "warnings":     warnings,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", run_id).execute()
+
+    except Exception as exc:
+        traceback.print_exc()
+        sb.table("allocation_runs").update({
+            "status":       "failed",
+            "warnings":     [str(exc)],
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", run_id).execute()
+
+
+@app.post("/run")
+def run_allocation(data: dict, background_tasks: BackgroundTasks):
+    sb = get_supabase()
+    cohort      = data.get("cohort", "first-years")
     semester_id = data.get("semester_id")
+    time_limit  = int(data.get("time_limit", 30))
 
     run_payload: dict = {"college_id": COLLEGE_ID, "cohort": cohort, "status": "running"}
     if semester_id:
         run_payload["semester_id"] = semester_id
 
-    run = sb.table("allocation_runs").insert(run_payload).execute()
+    run    = sb.table("allocation_runs").insert(run_payload).execute()
     run_id = run.data[0]["id"]
 
-    # Simulate algorithm (replace with real algorithm later)
-    await asyncio.sleep(5)
+    background_tasks.add_task(_run_allocation_task, run_id, cohort, semester_id, time_limit)
 
-    # Mark complete with placeholder stats
-    stats = {
-        "students_assigned_pct": 94,
-        "friend_requests_matched_pct": 71,
-        "room_type_preferences_met_pct": 88,
-        "block_preferences_met_pct": 79,
-        "hard_constraint_violations": 0,
-    }
-    warnings = [
-        "14 students: requested block full — assigned to next preferred block",
-        "8 students: en-suite unavailable — assigned shared bathroom",
-        "3 students: friend request could not be matched within same block",
-    ]
-    sb.table("allocation_runs").update({
-        "status": "complete",
-        "stats": stats,
-        "warnings": warnings,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", run_id).execute()
-
-    return {"run_id": run_id, "status": "complete", "stats": stats, "warnings": warnings}
+    return {"run_id": run_id, "status": "running"}
 
 
 # ── Data upload / template ────────────────────────────────────────────────────

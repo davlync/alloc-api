@@ -73,6 +73,7 @@ create table students (
   block_request_1    text,
   block_request_2    text,
   ra_block_id        uuid references blocks(id),
+  community_mult     float not null default 0.1,
   preference_token uuid not null default gen_random_uuid(),
   created_at timestamptz default now(),
   constraint students_college_semester_email_key unique nulls not distinct (college_id, semester_id, email)

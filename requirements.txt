@@ -7,3 +7,6 @@ httpx
 pytest-asyncio
 pandas
 openpyxl
+numpy
+pulp
+pyscipopt
