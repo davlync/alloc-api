@@ -873,23 +873,39 @@ def _compute_run_stats(alloc_int: dict, df_prefs: pd.DataFrame, students_data: l
     n_students = len(students_data)
     n_assigned  = len(alloc_int)
 
-    # Friend preferences matched (friend in same block)
-    total_friend_reqs = 0
-    friend_matched    = 0
+    # Friend preferences
+    # friend_any_matched_pct : % of students (with ≥1 request) who got ≥1 friend in same block
+    # friend_score_pct       : weighted % — rank-1 match worth 4pts, rank-2=3, rank-3=2, rank-4=1
+    RANK_WEIGHTS = {1: 4, 2: 3, 3: 2, 4: 1}
+    n_with_friends       = 0
+    n_any_matched        = 0
+    total_weighted_max   = 0
+    total_weighted_score = 0
     for _, row in df_prefs.iterrows():
         si = int(row["student"])
         my_block = alloc_int.get(si)
         if my_block is None:
             continue
+        reqs = {}
         for k in range(1, 5):
             fv = row.get(f"friend_request_{k}")
-            if pd.isna(fv):
-                continue
-            total_friend_reqs += 1
-            if alloc_int.get(int(fv)) == my_block:
-                friend_matched += 1
+            if not pd.isna(fv):
+                reqs[k] = int(fv)
+        if not reqs:
+            continue
+        n_with_friends += 1
+        any_match = False
+        for k, fid in reqs.items():
+            w = RANK_WEIGHTS[k]
+            total_weighted_max += w
+            if alloc_int.get(fid) == my_block:
+                total_weighted_score += w
+                any_match = True
+        if any_match:
+            n_any_matched += 1
 
-    friend_pct = round(friend_matched / total_friend_reqs * 100) if total_friend_reqs > 0 else 100
+    friend_any_pct   = round(n_any_matched / n_with_friends * 100)   if n_with_friends > 0 else 100
+    friend_score_pct = round(total_weighted_score / total_weighted_max * 100) if total_weighted_max > 0 else 100
 
     # Block preferences matched
     total_block_prefs = 0
@@ -942,7 +958,8 @@ def _compute_run_stats(alloc_int: dict, df_prefs: pd.DataFrame, students_data: l
 
     return {
         "students_assigned_pct":          round(n_assigned / n_students * 100) if n_students > 0 else 0,
-        "friend_requests_matched_pct":    friend_pct,
+        "friend_any_matched_pct":         friend_any_pct,
+        "friend_score_pct":               friend_score_pct,
         "room_type_preferences_met_pct":  0,  # room-level preference tracking not yet implemented
         "block_preferences_met_pct":      block_pct,
         "hard_constraint_violations":     n_no_pref_met,
