@@ -431,6 +431,231 @@ def get_run_status(run_id: str):
     return run.data
 
 
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+
+@app.get("/diagnose")
+def diagnose(
+    semester_id: str | None = Query(None),
+    cohort: str = Query("first-years"),
+):
+    """
+    Pre-flight check for allocation feasibility.
+    Returns a structured report and prints the same to stdout (Railway logs).
+    """
+    sb = get_supabase()
+    issues:   list[str] = []
+    warnings: list[str] = []
+
+    # ── Blocks ────────────────────────────────────────────────────────────────
+    q_blocks = sb.table("blocks").select("*").eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q_blocks = q_blocks.eq("semester_id", semester_id)
+    else:
+        q_blocks = q_blocks.is_("semester_id", "null")
+    blocks_data = q_blocks.execute().data
+
+    if not blocks_data:
+        issues.append("BLOCKS: no blocks found for this semester — upload data first")
+
+    # ── Rooms ─────────────────────────────────────────────────────────────────
+    block_uuids = [b["id"] for b in blocks_data]
+    rooms_data  = (
+        sb.table("rooms").select("*")
+        .eq("college_id", COLLEGE_ID)
+        .in_("block_id", block_uuids)
+        .eq("is_available", True)
+        .execute().data
+    ) if block_uuids else []
+
+    rooms_by_block: dict[str, list] = {b["id"]: [] for b in blocks_data}
+    for r in rooms_data:
+        if r["block_id"] in rooms_by_block:
+            rooms_by_block[r["block_id"]].append(r)
+
+    block_report = []
+    total_capacity = 0
+    for b in blocks_data:
+        cap      = len(rooms_by_block.get(b["id"], []))
+        cap_low  = float(b.get("block_cap_low") or 0.3)
+        cap_up   = float(b.get("block_cap_up")  or 0.9)
+        m_low    = float(b.get("male_cap_low")  or 0.4)
+        m_up     = float(b.get("male_cap_up")   or 0.6)
+        sm_cap   = int(b.get("small_room_cap")  or 0)
+        total_capacity += cap
+        entry = {
+            "name":           b["name"],
+            "capacity":       cap,
+            "block_cap_low":  cap_low,
+            "block_cap_up":   cap_up,
+            "male_cap_low":   m_low,
+            "male_cap_up":    m_up,
+            "small_room_cap": sm_cap,
+        }
+        if cap == 0:
+            entry["issue"] = "ZERO ROOMS — block cannot accept any student"
+            issues.append(f"BLOCK '{b['name']}': 0 rooms (capacity=0)")
+        if cap_up < 0.5:
+            entry["warning"] = f"block_cap_up={cap_up} looks very low (expected ~0.9)"
+            warnings.append(f"BLOCK '{b['name']}': block_cap_up={cap_up} suspiciously low")
+        block_report.append(entry)
+
+    # ── Students ──────────────────────────────────────────────────────────────
+    q_students = sb.table("students").select(
+        "id, name, year, is_ra, male, small_room, accessibility_required, ra_block_id, "
+        "friend_request_1, friend_request_2, block_request_1, block_request_2"
+    ).eq("college_id", COLLEGE_ID)
+    if semester_id:
+        q_students = q_students.eq("semester_id", semester_id)
+    else:
+        q_students = q_students.is_("semester_id", "null")
+    all_students = q_students.execute().data
+
+    cohort_students = [s for s in all_students if cohort != "first-years" or s.get("year") == 1]
+    n_students  = len(cohort_students)
+    n_males     = sum(1 for s in cohort_students if s.get("male"))
+    n_ras       = sum(1 for s in cohort_students if s.get("is_ra"))
+    n_small     = sum(1 for s in cohort_students if s.get("small_room"))
+    n_access    = sum(1 for s in cohort_students if s.get("accessibility_required"))
+    male_ratio  = round(n_males / n_students, 3) if n_students else 0
+
+    if n_students == 0:
+        issues.append(f"STUDENTS: no {cohort} students found for this semester")
+
+    # ── Capacity feasibility ──────────────────────────────────────────────────
+    if n_students > 0 and total_capacity > 0:
+        if total_capacity < n_students:
+            issues.append(
+                f"CAPACITY: total rooms ({total_capacity}) < students ({n_students}) "
+                f"— {n_students - total_capacity} students cannot be placed"
+            )
+        elif total_capacity < n_students * 1.05:
+            warnings.append(
+                f"CAPACITY: tight — only {total_capacity - n_students} spare rooms "
+                f"for {n_students} students"
+            )
+
+    # ── Gender feasibility ────────────────────────────────────────────────────
+    gender_enabled = male_ratio >= 0.1
+    if gender_enabled:
+        for b in blocks_data:
+            m_low = float(b.get("male_cap_low") or 0.4)
+            m_up  = float(b.get("male_cap_up")  or 0.6)
+            if male_ratio < m_low:
+                issues.append(
+                    f"GENDER: male ratio {male_ratio:.0%} is below male_cap_low "
+                    f"{m_low:.0%} on block '{b['name']}' — hard constraint will be infeasible"
+                )
+            if male_ratio > m_up:
+                issues.append(
+                    f"GENDER: male ratio {male_ratio:.0%} exceeds male_cap_up "
+                    f"{m_up:.0%} on block '{b['name']}' — hard constraint will be infeasible"
+                )
+    else:
+        warnings.append(
+            f"GENDER: only {n_males}/{n_students} students have male=true ({male_ratio:.0%}) "
+            f"— gender constraints will be disabled at runtime"
+        )
+
+    # ── RA pins ───────────────────────────────────────────────────────────────
+    ra_pin_report = []
+    block_id_to_name = {b["id"]: b["name"] for b in blocks_data}
+    for s in cohort_students:
+        if s.get("is_ra"):
+            ra_block_id = s.get("ra_block_id")
+            if not ra_block_id:
+                warnings.append(f"RA '{s['name']}': no ra_block_id set — will not be pinned")
+                ra_pin_report.append({"ra": s["name"], "block": None, "issue": "no block assigned"})
+            elif ra_block_id not in block_id_to_name:
+                issues.append(
+                    f"RA '{s['name']}': ra_block_id points to a block not in this semester"
+                )
+                ra_pin_report.append({"ra": s["name"], "block": ra_block_id, "issue": "block not in semester"})
+            else:
+                block_cap = len(rooms_by_block.get(ra_block_id, []))
+                ra_pin_report.append({"ra": s["name"], "block": block_id_to_name[ra_block_id], "capacity": block_cap})
+
+    # ── Small room check ──────────────────────────────────────────────────────
+    total_small_cap = sum(b.get("small_room_cap") or 0 for b in blocks_data)
+    if n_small > total_small_cap:
+        warnings.append(
+            f"SMALL ROOMS: {n_small} students want small rooms but total small_room_cap "
+            f"across all blocks is {total_small_cap} — soft slack will absorb this"
+        )
+
+    # ── Friend/block reference integrity ──────────────────────────────────────
+    student_names = {s["name"].strip().lower() for s in cohort_students}
+    block_names   = {b["name"].strip().lower() for b in blocks_data}
+    n_bad_friends = 0
+    n_bad_blocks  = 0
+    for s in cohort_students:
+        for k in range(1, 5):
+            fv = s.get(f"friend_request_{k}")
+            if fv and fv.strip().lower() not in student_names:
+                n_bad_friends += 1
+        for k in range(1, 3):
+            bv = s.get(f"block_request_{k}")
+            if bv and bv.strip().lower() not in block_names:
+                n_bad_blocks += 1
+    if n_bad_friends:
+        warnings.append(f"PREFS: {n_bad_friends} friend_request values don't match any student name in cohort")
+    if n_bad_blocks:
+        warnings.append(f"PREFS: {n_bad_blocks} block_request values don't match any block name in semester")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    feasible = len(issues) == 0
+    report = {
+        "feasible":       feasible,
+        "issues":         issues,
+        "warnings":       warnings,
+        "summary": {
+            "semester_id":     semester_id,
+            "cohort":          cohort,
+            "n_students":      n_students,
+            "n_all_students":  len(all_students),
+            "n_males":         n_males,
+            "male_ratio":      male_ratio,
+            "gender_constraints_enabled": gender_enabled,
+            "total_capacity":  total_capacity,
+            "capacity_slack":  total_capacity - n_students,
+            "n_ras":           n_ras,
+            "n_small_room":    n_small,
+            "n_accessibility": n_access,
+            "n_blocks":        len(blocks_data),
+            "n_rooms":         len(rooms_data),
+        },
+        "blocks": block_report,
+        "ra_pins": ra_pin_report,
+    }
+
+    # Print to stdout for Railway logs
+    print("\n" + "="*60)
+    print(f"DIAGNOSE  semester={semester_id}  cohort={cohort}")
+    print("="*60)
+    print(f"  Students  : {n_students} ({cohort})  |  all in semester: {len(all_students)}")
+    print(f"  Capacity  : {total_capacity} rooms across {len(blocks_data)} blocks  |  slack: {total_capacity - n_students}")
+    print(f"  Gender    : {n_males}/{n_students} male ({male_ratio:.0%})  constraints={'ON' if gender_enabled else 'OFF'}")
+    print(f"  RAs       : {n_ras}  |  small_room: {n_small}  |  accessibility: {n_access}")
+    print()
+    for b in block_report:
+        flag = "  *** " + b.get("issue", b.get("warning", "")) if ("issue" in b or "warning" in b) else ""
+        print(f"  {b['name']:20s}  cap={b['capacity']:3d}  "
+              f"low={b['block_cap_low']:.2f} up={b['block_cap_up']:.2f}  "
+              f"m_low={b['male_cap_low']:.2f} m_up={b['male_cap_up']:.2f}  "
+              f"sm={b['small_room_cap']}{flag}")
+    if issues:
+        print("\n  ISSUES (will cause infeasibility):")
+        for i in issues:
+            print(f"    ✗ {i}")
+    if warnings:
+        print("\n  WARNINGS:")
+        for w in warnings:
+            print(f"    ⚠ {w}")
+    print(f"\n  VERDICT: {'FEASIBLE ✓' if feasible else 'LIKELY INFEASIBLE ✗'}")
+    print("="*60 + "\n")
+
+    return report
+
+
 # ── Allocation algorithm helpers ──────────────────────────────────────────────
 
 def _build_allocation_dataframes(sb, cohort: str, semester_id: str | None):
