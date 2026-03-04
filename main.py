@@ -94,16 +94,10 @@ def debug_token(authorization: str = Header(None)):
         return {"error": "no authorization header"}
     token = authorization.removeprefix("Bearer ")
     try:
-        payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
-        return {"ok": True, "sub": payload.get("sub"), "aud": payload.get("aud")}
+        header = jwt.get_unverified_header(token)
+        return {"header": header, "secret_len": len(SUPABASE_JWT_SECRET), "secret_prefix": SUPABASE_JWT_SECRET[:6]}
     except Exception as e:
-        tb = traceback.format_exc()
-        # Also try without audience check
-        try:
-            payload2 = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-            return {"error": str(e), "without_aud_check": "OK", "aud_in_token": payload2.get("aud"), "secret_len": len(SUPABASE_JWT_SECRET)}
-        except Exception as e2:
-            return {"error": str(e), "without_aud_check": str(e2), "secret_len": len(SUPABASE_JWT_SECRET), "secret_prefix": SUPABASE_JWT_SECRET[:6]}
+        return {"error": str(e)}
 
 
 # ── Semesters ─────────────────────────────────────────────────────────────────
