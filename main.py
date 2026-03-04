@@ -28,8 +28,8 @@ _SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 _jwks_client = jwt.PyJWKClient(f"{_SUPABASE_URL}/auth/v1/.well-known/jwks.json") if _SUPABASE_URL else None
 
 
-def verify_token(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
+def verify_token(authorization: str | None = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization[len("Bearer "):]
     try:
