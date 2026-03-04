@@ -1093,22 +1093,22 @@ def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time
                 + ", ".join(names)
             )
 
-        # Gender rule breach check — compare actual male ratio per block against configured bounds
-        int_to_block_name = {v: b["name"] for b, v in
-                             ((b, block_uuid_to_int[b["id"]]) for b in blocks_data
-                              if b["id"] in block_uuid_to_int)}
+        # Gender rule breach check — compare actual male ratio against the original (unrelaxed)
+        # configured bounds from blocks_data, not the solver's widened tolerance bounds.
         male_bin_map = {int(row["student"]): int(row["male"]) for _, row in df_prefs.iterrows()
                         if not pd.isna(row.get("male"))}
-        for _, brow in df_info.iterrows():
-            bint = int(brow["block"])
+        for b in blocks_data:
+            if b["id"] not in block_uuid_to_int:
+                continue
+            bint  = block_uuid_to_int[b["id"]]
             assigned_ints = [si for si, bi in alloc_int.items() if bi == bint]
             if not assigned_ints:
                 continue
-            n_m = sum(male_bin_map.get(si, 0) for si in assigned_ints)
+            n_m   = sum(male_bin_map.get(si, 0) for si in assigned_ints)
             ratio = n_m / len(assigned_ints)
-            low  = float(brow["male_cap_low"])
-            up   = float(brow["male_cap_up"])
-            bname = int_to_block_name.get(bint, f"block #{bint}")
+            low   = float(b.get("male_cap_low") or 0.4)
+            up    = float(b.get("male_cap_up")  or 0.6)
+            bname = b["name"]
             if ratio < low:
                 warnings.append(
                     f"Gender rule breach — {bname}: {ratio:.0%} male "
