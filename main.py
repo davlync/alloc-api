@@ -1093,6 +1093,33 @@ def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time
                 + ", ".join(names)
             )
 
+        # Gender rule breach check — compare actual male ratio per block against configured bounds
+        int_to_block_name = {v: b["name"] for b, v in
+                             ((b, block_uuid_to_int[b["id"]]) for b in blocks_data
+                              if b["id"] in block_uuid_to_int)}
+        male_bin_map = {int(row["student"]): int(row["male"]) for _, row in df_prefs.iterrows()
+                        if not pd.isna(row.get("male"))}
+        for _, brow in df_info.iterrows():
+            bint = int(brow["block"])
+            assigned_ints = [si for si, bi in alloc_int.items() if bi == bint]
+            if not assigned_ints:
+                continue
+            n_m = sum(male_bin_map.get(si, 0) for si in assigned_ints)
+            ratio = n_m / len(assigned_ints)
+            low  = float(brow["male_cap_low"])
+            up   = float(brow["male_cap_up"])
+            bname = int_to_block_name.get(bint, f"block #{bint}")
+            if ratio < low:
+                warnings.append(
+                    f"Gender rule breach — {bname}: {ratio:.0%} male "
+                    f"(min {low:.0%}, {n_m}/{len(assigned_ints)} students)"
+                )
+            elif ratio > up:
+                warnings.append(
+                    f"Gender rule breach — {bname}: {ratio:.0%} male "
+                    f"(max {up:.0%}, {n_m}/{len(assigned_ints)} students)"
+                )
+
         sb.table("allocation_runs").update({
             "status":       "complete",
             "stats":        stats,
