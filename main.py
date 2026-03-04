@@ -24,7 +24,8 @@ app.add_middleware(
 )
 
 COLLEGE_ID = "00000000-0000-0000-0000-000000000001"
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+_SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+_jwks_client = jwt.PyJWKClient(f"{_SUPABASE_URL}/auth/v1/.well-known/jwks.json") if _SUPABASE_URL else None
 
 
 def verify_token(authorization: str = Header(...)):
@@ -32,8 +33,9 @@ def verify_token(authorization: str = Header(...)):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization[len("Bearer "):]
     try:
-        jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
-    except jwt.PyJWTError:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        jwt.decode(token, signing_key, algorithms=["RS256", "ES256"], audience="authenticated")
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
@@ -86,18 +88,6 @@ def _safe_int(val, default: int) -> int:
 def health_check():
     return {"status": "ok"}
 
-
-@app.get("/debug-token")
-def debug_token(authorization: str = Header(None)):
-    import traceback
-    if not authorization:
-        return {"error": "no authorization header"}
-    token = authorization.removeprefix("Bearer ")
-    try:
-        header = jwt.get_unverified_header(token)
-        return {"header": header, "secret_len": len(SUPABASE_JWT_SECRET), "secret_prefix": SUPABASE_JWT_SECRET[:6]}
-    except Exception as e:
-        return {"error": str(e)}
 
 
 # ── Semesters ─────────────────────────────────────────────────────────────────

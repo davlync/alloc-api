@@ -10,4 +10,4 @@ openpyxl
 numpy
 pulp
 pyscipopt
-PyJWT
+PyJWT[crypto]
