@@ -7,8 +7,9 @@ import re
 import traceback
 from datetime import datetime, timezone
 
+import jwt
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, Form
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, Header, HTTPException, UploadFile, File, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from supabase import create_client, Client
@@ -23,6 +24,20 @@ app.add_middleware(
 )
 
 COLLEGE_ID = "00000000-0000-0000-0000-000000000001"
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+
+
+def verify_token(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization[len("Bearer "):]
+    try:
+        jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+router = APIRouter(dependencies=[Depends(verify_token)])
 
 
 def get_supabase() -> Client:
@@ -74,7 +89,7 @@ def health_check():
 
 # ── Semesters ─────────────────────────────────────────────────────────────────
 
-@app.get("/semesters")
+@router.get("/semesters")
 def list_semesters():
     sb = get_supabase()
     res = (
@@ -87,7 +102,7 @@ def list_semesters():
     return res.data
 
 
-@app.post("/semesters")
+@router.post("/semesters")
 def create_semester(data: dict):
     sb = get_supabase()
     copy_from_semester_id = data.pop("copy_from_semester_id", None)
@@ -143,7 +158,7 @@ def create_semester(data: dict):
     return new_semester
 
 
-@app.delete("/semesters/{semester_id}")
+@router.delete("/semesters/{semester_id}")
 def delete_semester(semester_id: str):
     sb = get_supabase()
     completed = (
@@ -164,7 +179,7 @@ def delete_semester(semester_id: str):
 
 # ── Students ──────────────────────────────────────────────────────────────────
 
-@app.get("/students")
+@router.get("/students")
 def list_students(semester_id: str | None = Query(None)):
     sb = get_supabase()
     q = sb.table("students").select("*").eq("college_id", COLLEGE_ID)
@@ -173,7 +188,7 @@ def list_students(semester_id: str | None = Query(None)):
     return q.order("name").execute().data
 
 
-@app.post("/students")
+@router.post("/students")
 def create_student(data: dict):
     sb = get_supabase()
     data["college_id"] = COLLEGE_ID
@@ -181,7 +196,7 @@ def create_student(data: dict):
     return res.data[0]
 
 
-@app.put("/students/{student_id}")
+@router.put("/students/{student_id}")
 def update_student(student_id: str, data: dict):
     sb = get_supabase()
     data.pop("id", None)
@@ -198,14 +213,14 @@ def update_student(student_id: str, data: dict):
     return res.data[0]
 
 
-@app.delete("/students/{student_id}")
+@router.delete("/students/{student_id}")
 def delete_student(student_id: str):
     sb = get_supabase()
     sb.table("students").delete().eq("id", student_id).eq("college_id", COLLEGE_ID).execute()
     return {"deleted": student_id}
 
 
-@app.post("/students/import")
+@router.post("/students/import")
 async def import_students(
     file: UploadFile = File(...),
     semester_id: str | None = Query(None),
@@ -251,7 +266,7 @@ async def import_students(
 
 # ── Blocks ────────────────────────────────────────────────────────────────────
 
-@app.get("/blocks")
+@router.get("/blocks")
 def list_blocks(semester_id: str | None = Query(None)):
     sb = get_supabase()
     q = sb.table("blocks").select("*").eq("college_id", COLLEGE_ID)
@@ -262,7 +277,7 @@ def list_blocks(semester_id: str | None = Query(None)):
     return data
 
 
-@app.post("/blocks")
+@router.post("/blocks")
 def create_block(data: dict):
     sb = get_supabase()
     data["college_id"] = COLLEGE_ID
@@ -270,7 +285,7 @@ def create_block(data: dict):
     return res.data[0]
 
 
-@app.put("/blocks/{block_id}")
+@router.put("/blocks/{block_id}")
 def update_block(block_id: str, data: dict):
     sb = get_supabase()
     data.pop("id", None)
@@ -287,7 +302,7 @@ def update_block(block_id: str, data: dict):
     return res.data[0]
 
 
-@app.delete("/blocks/{block_id}")
+@router.delete("/blocks/{block_id}")
 def delete_block(block_id: str):
     sb = get_supabase()
     sb.table("blocks").delete().eq("id", block_id).eq("college_id", COLLEGE_ID).execute()
@@ -296,7 +311,7 @@ def delete_block(block_id: str):
 
 # ── Rooms ─────────────────────────────────────────────────────────────────────
 
-@app.get("/rooms")
+@router.get("/rooms")
 def list_rooms(semester_id: str | None = Query(None)):
     sb = get_supabase()
     q = sb.table("rooms").select("*, blocks(name)").eq("college_id", COLLEGE_ID)
@@ -307,7 +322,7 @@ def list_rooms(semester_id: str | None = Query(None)):
     return data
 
 
-@app.post("/rooms")
+@router.post("/rooms")
 def create_room(data: dict):
     sb = get_supabase()
     data["college_id"] = COLLEGE_ID
@@ -315,7 +330,7 @@ def create_room(data: dict):
     return res.data[0]
 
 
-@app.put("/rooms/{room_id}")
+@router.put("/rooms/{room_id}")
 def update_room(room_id: str, data: dict):
     sb = get_supabase()
     data.pop("id", None)
@@ -333,7 +348,7 @@ def update_room(room_id: str, data: dict):
     return res.data[0]
 
 
-@app.delete("/rooms/{room_id}")
+@router.delete("/rooms/{room_id}")
 def delete_room(room_id: str):
     sb = get_supabase()
     sb.table("rooms").delete().eq("id", room_id).eq("college_id", COLLEGE_ID).execute()
@@ -342,7 +357,7 @@ def delete_room(room_id: str):
 
 # ── Rules ─────────────────────────────────────────────────────────────────────
 
-@app.get("/rules")
+@router.get("/rules")
 def list_rules(semester_id: str | None = Query(None)):
     sb = get_supabase()
     q = sb.table("rules").select("*").eq("college_id", COLLEGE_ID)
@@ -351,7 +366,7 @@ def list_rules(semester_id: str | None = Query(None)):
     return q.order("rule_type").execute().data
 
 
-@app.post("/rules")
+@router.post("/rules")
 def create_rule(data: dict):
     sb = get_supabase()
     data["college_id"] = COLLEGE_ID
@@ -359,7 +374,7 @@ def create_rule(data: dict):
     return res.data[0]
 
 
-@app.put("/rules/{rule_id}")
+@router.put("/rules/{rule_id}")
 def update_rule(rule_id: str, data: dict):
     sb = get_supabase()
     data.pop("id", None)
@@ -376,7 +391,7 @@ def update_rule(rule_id: str, data: dict):
     return res.data[0]
 
 
-@app.delete("/rules/{rule_id}")
+@router.delete("/rules/{rule_id}")
 def delete_rule(rule_id: str):
     sb = get_supabase()
     sb.table("rules").delete().eq("id", rule_id).eq("college_id", COLLEGE_ID).execute()
@@ -385,7 +400,7 @@ def delete_rule(rule_id: str):
 
 # ── Allocation runs ───────────────────────────────────────────────────────────
 
-@app.get("/runs")
+@router.get("/runs")
 def list_runs(semester_id: str | None = Query(None)):
     sb = get_supabase()
     q = sb.table("allocation_runs").select("*").eq("college_id", COLLEGE_ID)
@@ -394,7 +409,7 @@ def list_runs(semester_id: str | None = Query(None)):
     return q.order("created_at", desc=True).execute().data
 
 
-@app.get("/runs/{run_id}")
+@router.get("/runs/{run_id}")
 def get_run(run_id: str):
     sb = get_supabase()
     run = (
@@ -415,7 +430,7 @@ def get_run(run_id: str):
     return {**run.data, "allocations": allocations.data}
 
 
-@app.get("/runs/{run_id}/status")
+@router.get("/runs/{run_id}/status")
 def get_run_status(run_id: str):
     """Lightweight poll endpoint — returns run row only, no allocations join."""
     sb = get_supabase()
@@ -433,7 +448,7 @@ def get_run_status(run_id: str):
 
 # ── Diagnostics ───────────────────────────────────────────────────────────────
 
-@app.get("/diagnose")
+@router.get("/diagnose")
 def diagnose(
     semester_id: str | None = Query(None),
     cohort: str = Query("first-years"),
@@ -1136,7 +1151,7 @@ def _run_allocation_task(run_id: str, cohort: str, semester_id: str | None, time
         }).eq("id", run_id).execute()
 
 
-@app.post("/run")
+@router.post("/run")
 def run_allocation(data: dict, background_tasks: BackgroundTasks):
     sb = get_supabase()
     cohort      = data.get("cohort", "first-years")
@@ -1157,7 +1172,7 @@ def run_allocation(data: dict, background_tasks: BackgroundTasks):
 
 # ── Data upload / template ────────────────────────────────────────────────────
 
-@app.post("/data/upload")
+@router.post("/data/upload")
 async def upload_data(
     file: UploadFile = File(...),
     semester_id: str | None = Form(None),
@@ -1374,7 +1389,7 @@ async def upload_data(
     }
 
 
-@app.get("/data/template")
+@router.get("/data/template")
 def download_template():
     """Return a blank xlsx template with the correct sheet structure."""
     output = io.BytesIO()
@@ -1433,3 +1448,6 @@ def download_template():
             "Content-Disposition": "attachment; filename=christreasurer_template.xlsx"
         },
     )
+
+
+app.include_router(router)

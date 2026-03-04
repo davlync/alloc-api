@@ -10,3 +10,4 @@ openpyxl
 numpy
 pulp
 pyscipopt
+PyJWT
