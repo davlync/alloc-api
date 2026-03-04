@@ -11,3 +11,4 @@ numpy
 pulp
 pyscipopt
 PyJWT[crypto]
+resend

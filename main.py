@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 
 import jwt
 import pandas as pd
+import resend
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, Header, HTTPException, UploadFile, File, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from supabase import create_client, Client
 
 app = FastAPI(title="ChrisTreasurer API")
@@ -189,6 +191,22 @@ def list_students(semester_id: str | None = Query(None)):
     if semester_id:
         q = q.eq("semester_id", semester_id)
     return q.order("name").execute().data
+
+
+@router.get("/students/{student_id}")
+def get_student(student_id: str):
+    sb = get_supabase()
+    res = (
+        sb.table("students")
+        .select("*")
+        .eq("id", student_id)
+        .eq("college_id", COLLEGE_ID)
+        .single()
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return res.data
 
 
 @router.post("/students")
@@ -1451,6 +1469,120 @@ def download_template():
             "Content-Disposition": "attachment; filename=christreasurer_template.xlsx"
         },
     )
+
+
+# ── Student preference public endpoints ───────────────────────────────────────
+
+class PrefsBody(BaseModel):
+    small_room: bool = False
+    accessibility_required: bool = False
+    friend_request_1: str | None = None
+    friend_request_2: str | None = None
+    friend_request_3: str | None = None
+    friend_request_4: str | None = None
+    enemy_request_1: str | None = None
+    enemy_request_2: str | None = None
+    enemy_request_3: str | None = None
+    enemy_request_4: str | None = None
+    block_request_1: str | None = None
+    block_request_2: str | None = None
+
+
+class SendPrefsBody(BaseModel):
+    student_ids: list[str]
+    semester_id: str
+    semester_name: str
+
+
+# NOTE: /preferences/send must be registered before /preferences/{token} to avoid
+# FastAPI matching "send" as the token path parameter.
+@app.post("/preferences/send", dependencies=[Depends(verify_token)])
+def send_preferences(body: SendPrefsBody):
+    sb = get_supabase()
+    api_key = os.environ.get("RESEND_API_KEY", "")
+    from_addr = os.environ.get("RESEND_FROM", "noreply@example.com")
+    frontend_url = os.environ.get("FRONTEND_URL", "https://christreasurer.vercel.app")
+
+    resend.api_key = api_key
+
+    res = (
+        sb.table("students")
+        .select("name,email,preference_token")
+        .in_("id", body.student_ids)
+        .execute()
+    )
+    students = res.data or []
+    sent = 0
+    for s in students:
+        link = f"{frontend_url}/student/preferences?token={s['preference_token']}"
+        html = f"""
+<html><body style="font-family:sans-serif;color:#1a1a2e;max-width:600px;margin:0 auto;padding:24px">
+  <h2 style="margin-bottom:8px">Room preferences — Christ's College {body.semester_name}</h2>
+  <p>Hi {s['name']},</p>
+  <p>Please use the link below to submit your room preferences for the upcoming semester allocation.</p>
+  <p style="margin:24px 0">
+    <a href="{link}" style="background:#4f46e5;color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600">
+      Submit My Preferences
+    </a>
+  </p>
+  <p style="color:#6b7280;font-size:13px">This link is unique to you — please don't share it.</p>
+</body></html>"""
+        resend.Emails.send({
+            "from": from_addr,
+            "to": s["email"],
+            "subject": f"Room preferences — Christ's College {body.semester_name}",
+            "html": html,
+        })
+        sent += 1
+    return {"sent": sent}
+
+
+@app.get("/preferences/{token}")
+def get_preferences(token: str):
+    sb = get_supabase()
+    res = (
+        sb.table("students")
+        .select(
+            "name,year,small_room,accessibility_required,"
+            "friend_request_1,friend_request_2,friend_request_3,friend_request_4,"
+            "enemy_request_1,enemy_request_2,enemy_request_3,enemy_request_4,"
+            "block_request_1,block_request_2,semester_id,college_id"
+        )
+        .eq("preference_token", token)
+        .single()
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Token not found")
+    student = res.data
+    semester_id = student.pop("semester_id")
+    college_id = student.pop("college_id")
+    blocks_res = (
+        sb.table("blocks")
+        .select("id,name")
+        .eq("college_id", college_id)
+        .eq("semester_id", semester_id)
+        .execute()
+    )
+    blocks = sorted(blocks_res.data or [], key=lambda b: _natural_key(b["name"]))
+    return {"student": student, "blocks": blocks}
+
+
+@app.post("/preferences/{token}")
+def submit_preferences(token: str, body: PrefsBody):
+    sb = get_supabase()
+    res = (
+        sb.table("students")
+        .select("id")
+        .eq("preference_token", token)
+        .single()
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Token not found")
+    student_id = res.data["id"]
+    sb.table("students").update(body.model_dump()).eq("id", student_id).execute()
+    return {"ok": True}
 
 
 app.include_router(router)
